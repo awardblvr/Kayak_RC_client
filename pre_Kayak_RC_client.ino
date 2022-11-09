@@ -47,6 +47,7 @@ static uint32_t tick16=0, tick128=0, tick30000=0;
 uint16_t maxPotAdcVal=5000;  // used in scaling, adjusts higher if new value is higher
 uint32_t lastActionMillis=0;
 int avgRightTouchVal=0, lastAvgRightTouchVal=0;
+bool LC709203FisOK = false;
 
 #define BUTTON_LEFT_PIN 6
 #define BUTTON_RIGHT_PIN 5
@@ -210,10 +211,16 @@ void updateBatteryDisplay(void)
     uint16_t color = ST77XX_ORANGE;
 
     clearSizedTextLine(DISP_BATT_LINE_SIZE, DISP_BATT_LINE_PIXEL);
-    tft.setTextColor(ST77XX_GREEN);
-    snprintf(tft_lin_buf, sizeof(tft_lin_buf), "B v:%.2f, charge:%.0f\\%", lc.cellVoltage(), lc.cellPercent() );
+    if (LC709203FisOK) {
+        tft.setTextColor(ST77XX_GREEN);
+        snprintf(tft_lin_buf, sizeof(tft_lin_buf), "B v:%.2f, charge:%.0f%%", lc.cellVoltage(), lc.cellPercent() );
+    } else {
+        tft.setTextColor(ST77XX_RED);
+        snprintf(tft_lin_buf, sizeof(tft_lin_buf), "LC709203F is NOT OK");
+    }
     tft.println( tft_lin_buf );
 }
+
 
 // ---------------------- Button Callbacks & Handlers  ------------------------
 void onLeftPressShortRelease(void)
@@ -426,38 +433,29 @@ void setup() {
 
     snprintf(tft_lin_buf, sizeof(tft_lin_buf), "Built %s @ %s", __DATE__, __TIME__);
     tft.println( tft_lin_buf );
-    tft.println();
-
-#if defined(ARDUINO_ADAFRUIT_FEATHER_ESP32S2)
-    // ---------------------- LiON Battery Monitor (LC709203F) ------------------------
-    Serial.println(F("Check for Adafruit LC709203F..."));
-
-    // For the Feather ESP32-S2, we need to enable I2C power first!
-    // this section can be deleted for other boards
-    // turn on the I2C power by setting pin to opposite of 'rest state'
-    pinMode(PIN_I2C_POWER, INPUT);
-    delay(1);
-    bool polarity = digitalRead(PIN_I2C_POWER);
-    pinMode(PIN_I2C_POWER, OUTPUT);
-    digitalWrite(PIN_I2C_POWER, !polarity);
-#else
-    Serial.println(F("\nNOT SET UP - (undefined ARDUINO_ADAFRUIT_FEATHER_ESP32S2)!"));
-#endif
 
     if (!lc.begin()) {
-      Serial.println(F("Couldn't find Adafruit LC709203F?\nMake sure a battery is plugged in!"));
-      //while (1) delay(10);
+        tft.setTextColor(ST77XX_RED);
+        snprintf(tft_lin_buf, sizeof(tft_lin_buf), "NOT FINDING LC709203F! Batt unplugged??");
+        tft.println( tft_lin_buf );
+        Serial.println(F("Couldn't find Adafruit LC709203F?\nMake sure a battery is plugged in!"));
+    } else {
+        Serial.println(F("Found LC709203F"));
+        Serial.print("Version: 0x"); Serial.println(lc.getICversion(), HEX);
+
+        lc.setThermistorB(3950);
+        Serial.print("Thermistor B = "); Serial.println(lc.getThermistorB());
+
+        lc.setPackSize(LC709203F_APA_500MAH);
+
+        lc.setAlarmVoltage(3.8);  // Not really needed (or used), since the alarm pin out is NC
+
+        tft.setTextColor(ST77XX_CYAN);
+        snprintf(tft_lin_buf, sizeof(tft_lin_buf), "LC709203F: @Boot v:%.2f, :%.0f%%", lc.cellVoltage(), lc.cellPercent() );
+        tft.println( tft_lin_buf );
+
+        LC709203FisOK = true;
     }
-    Serial.println(F("Found LC709203F"));
-    Serial.print("Version: 0x"); Serial.println(lc.getICversion(), HEX);
-
-    lc.setThermistorB(3950);
-    Serial.print("Thermistor B = "); Serial.println(lc.getThermistorB());
-
-    lc.setPackSize(LC709203F_APA_500MAH);
-
-    lc.setAlarmVoltage(3.8);
-
 
     // ---------------------- simpleEspConnection (comms initialization) ------------------------
 
