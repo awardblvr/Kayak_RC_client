@@ -26,12 +26,18 @@
 #include <EasyButton.h>
 #include "Adafruit_LC709203F.h"
 #include <Adafruit_NeoPixel.h>
+#include <BMI160Gen.h>
 #include <vector>
 #include <movingAvg.h>                  // https://github.com/JChristensen/movingAvg
 
 
+#define debug(x) Serial.print(x)
+#define debugln(x) Serial.println(x)
+
 //ESP32-S2-TFT   7C:DF:A1:95:0C:6E
 
+//  Use RTC_DATA_ATT as a prefix to any var below to save in RTC Ram
+//  (not lost uin sleep modes, but resets on full power-cycle  or reboot
 String inputString;
 String serverAddress;
 String clientAddress;  // This is me
@@ -46,8 +52,14 @@ uint8_t motorSpeedPercent=0;
 static uint32_t tick16=0, tick128=0, tick30000=0;
 uint16_t maxPotAdcVal=5000;  // used in scaling, adjusts higher if new value is higher
 uint32_t lastActionMillis=0;
-int avgRightTouchVal=0, lastAvgRightTouchVal=0;
+int avgRightTouchVal=1, lastAvgRightTouchVal=1;
+bool touchUpdateHoldoff=false;
 bool LC709203FisOK = false;
+uint32_t nextMotionUnblockMillis=0;
+uint32_t motionDisplayNextOffMillis=0;
+bool motionWasTriggered=false;
+
+#define DEFAULT_I2C_PORT &Wire
 
 #define BUTTON_LEFT_PIN 6
 #define BUTTON_RIGHT_PIN 5
@@ -55,6 +67,9 @@ bool LC709203FisOK = false;
 #define SWITCH_FORWARD_PIN 10
 #define SWITCH_REVERSE_PIN 9
 #define SPEED_CONTROL_POT_PIN 8
+#define ACCEL_INT_1_PIN 15
+
+#define I2C_ADDR_ACCEL_BMI160 0x69
 
 #define DISP_GEAR_LINE_PIXEL 42
 #define DISP_GEAR_SIZE 3
@@ -70,6 +85,8 @@ bool LC709203FisOK = false;
 
 #define INACTIVITY_MS_BEFORE_REDUCE_PWR 60000
 #define INACTIVITY_MS_BEFORE_SLEEP 1200000
+#define AFTER_MOTION_IGNORE_MS 30000
+#define MOTION_DISPLAY_MS 5000
 
 // Use dedicated hardware SPI pins
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
@@ -77,7 +94,7 @@ SimpleEspNowConnection simpleEspConnection(SimpleEspNowRole::CLIENT);
 Adafruit_LC709203F lc;
 Adafruit_NeoPixel pixel(1 /*NUMPIXELS*/, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 movingAvg avgSpeed(100);                  // define the moving average object
-movingAvg avgRightTouch(40);              // define the moving average object
+movingAvg avgRightTouch(100);              // define the moving average object
 
 EasyButton buttonRight(BUTTON_RIGHT_PIN);
 EasyButton buttonLeft(BUTTON_LEFT_PIN);
@@ -197,12 +214,22 @@ void updateGearStateDisplay(void)
 void updateTouchDisplay(void)
 {
     uint16_t color = ST77XX_ORANGE;
+    uint32_t aRTV=0;
 
     clearSizedTextLine(DISP_DEBUG_LINE_SIZE, DISP_DEBUG_LINE_PIXEL);
-    tft.setTextColor(color);
-    tft.print("Touch:");
-    tft.setTextColor(ST77XX_WHITE);
-    tft.print(" " + String(avgRightTouchVal));
+    if (!touchUpdateHoldoff) {
+        tft.setTextColor(color);
+        tft.print("Touch:");
+        tft.setTextColor(ST77XX_WHITE);
+        aRTV = avgRightTouchVal > 1000 ? avgRightTouchVal = avgRightTouchVal/100 : avgRightTouchVal;
+        tft.print(" " + String(aRTV));
+        if (motionDisplayNextOffMillis != 0) {
+            tft.setTextColor(ST77XX_MAGENTA);
+            tft.print("  MOTION");
+        }
+    } else {
+        Serial.println("touchUpdateHoldoff!  Skipping display update");
+    }
 
 }
 
@@ -241,18 +268,13 @@ void onLeftPressShortRelease(void)
     //lineLocator(3, 14, 7);
     //lineLocator(3, 15, 9);
 
+    touchUpdateHoldoff = true;
+    digitalWrite(TFT_BACKLITE, LOW);
 
-     //  tft.setCursor(0 /*int16_t x0*/, 0 /*int16_t y0*/);
-     //  tft.setTextSize(1);
-     //  clearTextLine(41);
-     //
-     //  tft.setTextSize(3);
-     //  // tft.setTextColor(ST77XX_RED);
-     //  // tft.println(".");
-     //  tft.setCursor(0 /*int16_t x0*/, 25 /*int16_t y0*/);
-     //  clearTextLine(14, true);
-     //  tft.setTextColor(ST77XX_BLUE);
-     //  tft.println("SUPER MAN!");
+    delay(500);
+    updateGearStateDisplay();
+    updateBatteryDisplay();
+
 }
 
 void onLeftPressLongStart(void)
@@ -274,6 +296,10 @@ void onRightPressShortRelease(void)
     pixel.clear();
     pixel.show();
 
+    digitalWrite(TFT_BACKLITE, HIGH);
+
+    touchUpdateHoldoff = false;
+
 }
 
 void onRightPressLongRelease(void)
@@ -287,10 +313,12 @@ void onRightPressLongRelease(void)
 
     if (buttonLeft.isPressed()) {
         Serial.println("Initiating Reboot Sequence");
-        clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
-        tft.setTextColor(ST77XX_RED);
-        tft.print("REBOOT in 4");
-        delay(4000);
+        for (int i=4; i; i--){
+            clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
+            tft.setTextColor(ST77XX_RED);
+            tft.print("REBOOT in " + String(i));
+            delay(1000);
+        }
         ESP.restart();
     }
 }
@@ -330,6 +358,48 @@ void onSwitchReverseRelease(void)
 }
 
 
+void bmi160_intr(void)
+{
+    Serial.println("BMI160 interrupt: MOTION?");
+    motionWasTriggered = true;
+    // unblock motion interrupts after 30 sec
+    //nextMotionUnblockMillis = millis() + AFTER_MOTION_IGNORE_MS;
+    //BMI160.setIntMotionEnabled(false);
+}
+
+float convertRawGyro(int gRaw) {
+    // since we are using 250 degrees/seconds range
+    // -250 maps to a raw value of -32768
+    // +250 maps to a raw value of 32767
+
+    float g = (gRaw * 250.0) / 32768.0;
+
+    return g;
+}
+
+void check_IMU(void)
+{
+    int gxRaw, gyRaw, gzRaw;         // raw gyro values
+    float gx, gy, gz;
+
+    // read raw gyro measurements from device
+    BMI160.readGyro(gxRaw, gyRaw, gzRaw);
+
+    // convert the raw gyro data to degrees/second
+    gx = convertRawGyro(gxRaw);
+    gy = convertRawGyro(gyRaw);
+    gz = convertRawGyro(gzRaw);
+    
+    // display tab-separated gyro x/y/z values
+    Serial.print("g:\t");
+    Serial.print(gx);
+    Serial.print("\t");
+    Serial.print(gy);
+    Serial.print("\t");
+    Serial.print(gz);
+    Serial.println();
+
+}
 
 // Notes:
 //    My Adafruit Feather ES:32-S2 TFT  mac address is 7C:DF:A1:95:0C:6E   This is the CLIENT (This code)
@@ -341,8 +411,14 @@ typedef struct struct_message {
   int b;
   float c;
   bool e;
-}
-struct_message;
+} struct_message;
+
+typedef struct yak_message {
+    uint32_t    msg_id;
+    enum action { PING, MOTOR_CONTROL, BATTERY_CHECK, BATTERY_MESSAGING, NEW_CLIENT_MAC, BLUETOOTH_PAIR };
+    enum gear { NEUTRAL, FORWARD, REVERSE };
+    uint8_t     speed;  // (0-100)
+} yak_message_t;
 
 bool sendBigMessage() {
   char bigMessage[] = "\n\
@@ -399,11 +475,7 @@ void OnNewGatewayAddress(uint8_t * ga, String ad) {
 }
 
 
-//void toScreen(char *textBuf, textSize, textColor, int lineNum=-1 )
-//{
-//
-//
-//}
+
 
 void setup() {
     Serial.begin(115200);
@@ -446,7 +518,10 @@ void setup() {
         lc.setThermistorB(3950);
         Serial.print("Thermistor B = "); Serial.println(lc.getThermistorB());
 
-        lc.setPackSize(LC709203F_APA_500MAH);
+        //   LC709203F_APA_500MAH = 0x10,
+        //   LC709203F_APA_1000MAH = 0x19,
+        // Our battery is 850 mA.. So trying 0x13  (slightly less than intuitive)
+        lc.setPackSize((lc709203_adjustment_t)0x13);
 
         lc.setAlarmVoltage(3.8);  // Not really needed (or used), since the alarm pin out is NC
 
@@ -456,6 +531,44 @@ void setup() {
 
         LC709203FisOK = true;
     }
+
+    // ---------------------- BMI160 IMU (Accelerometer/Gyro) Initialization ------------------------
+    Serial.println("Initializing IMU device...");
+    //BMI160.begin(BMI160GenClass::SPI_MODE, /* SS pin# = */10);
+    BMI160.begin(BMI160GenClass::I2C_MODE, I2C_ADDR_ACCEL_BMI160, ACCEL_INT_1_PIN);
+    uint8_t dev_id = BMI160.getDeviceID();
+    Serial.print("IMU DEVICE ID: ");
+    Serial.println(dev_id, HEX);
+
+    BMI160.attachInterrupt(bmi160_intr);
+    //BMI160.setIntTapEnabled(true);
+
+     // Set the accelerometer range to 250 degrees/second
+    BMI160.setGyroRange(250);
+
+    Serial.println("IMU: setIntMotionEnabled...");
+    BMI160.setIntMotionEnabled(true);
+
+    // FullScaleGyroRange default:  3 = +/-  250 degrees/sec
+    Serial.print("IMU: getFullScaleGyroRange:");
+    Serial.print(BMI160.getFullScaleGyroRange());
+    Serial.print(", IntMotionEnabled:");
+    Serial.print(BMI160.getIntMotionEnabled());
+    Serial.print(", Orig MotionDetectionThreshold:");
+    Serial.print(BMI160.getMotionDetectionThreshold());
+    Serial.println();
+
+    BMI160.setMotionDetectionThreshold(150.0);
+
+    Serial.print("NEW MotionDetectionThreshold:");
+    Serial.print(BMI160.getMotionDetectionThreshold());
+    // Serial.print(", FullScaleAccelRange: ");
+    // Serial.print(BMI160.getFullScaleAccelRange());
+    // Serial.print(", [MotionDetectionDuration: ");
+    // Serial.print(BMI160.getMotionDetectionDuration());
+    // Serial.print("]");
+    Serial.println();
+    Serial.println("Initializing IMU device...done.");
 
     // ---------------------- simpleEspConnection (comms initialization) ------------------------
 
@@ -502,7 +615,7 @@ void setup() {
 
     // ---------------------- set up general IO  (Or Analog Stuff?)   ------------------------
     avgSpeed.begin();
-    //avgRightTouch.begin();
+    avgRightTouch.begin();
 
 
 
@@ -523,8 +636,6 @@ void task30s(void) {
 
 void task128ms(void)
 {
-    static float touchPercentChange=0;
-    static float lastRightTouch=0;
 
     motorSpeedPotVal = avgSpeed.getAvg();
     float diffVal =     motorSpeedPotVal-lastMotorSpeedPotVal;
@@ -544,30 +655,59 @@ void task128ms(void)
         //Serial.println("");
     }
 
+    // Touch Debug/Adjust: Serial.println("Touch Raw: " + String(touchRead(BUTTON_RIGHT_TOUCH_PIN)));
+    avgRightTouchVal = avgRightTouch.getAvg();
+    // Touch Debug/Adjust: Serial.println("TOUCH AVG: " + String(avgRightTouchVal) );
 
-    //avgRightTouchVal = avgRightTouch.getAvg();
-    //if (avgRightTouchVal != lastAvgRightTouchVal) {
-    //    lastAvgRightTouchVal = avgRightTouchVal;
-    //    updateTouchDisplay();
-    //}
+    long percentIncr = (lastAvgRightTouchVal *  110)/100;  // integer math: val + 10%
+    long percentDecr = (lastAvgRightTouchVal *  90)/100;   // integer math: val - 10%
+    // Touch Debug/Adjust: Serial.println("percentIncr="+String(percentIncr)+" of "+String(lastAvgRightTouchVal));
+    // Touch Debug/Adjust: Serial.println("percentDecr="+String(percentDecr)+" of "+String(lastAvgRightTouchVal));
+    // Touch Debug/Adjust: Serial.println("Avg now " + String(avgRightTouchVal) );
 
-    //Serial.print("Avg=");
-    //Serial.print(motorSpeedPotVal);
-    //Serial.print("   ");
-    //Serial.print(percentChange);
-    //Serial.println("% change");
-    //Serial.println("Avg="+String(motorSpeedPotVal)+"   "+String(percentChange)+"% change");
-    //if ( percentChange > 20 ) {
-    //    Serial.println("Refresh!");
-    //    lastMotorSpeedPotVal = motorSpeedPotVal;
-    //    updateGearStateDisplay();
-    //}
+    if ((avgRightTouchVal < percentDecr) ||
+        (avgRightTouchVal > percentIncr)) {
+         lastAvgRightTouchVal = avgRightTouchVal;
+        updateTouchDisplay();
+    }
+
+    //check_IMU();
+    if (nextMotionUnblockMillis == 1) {
+        // WHAT ?? Serial.println("")
+
+    } else if ( (nextMotionUnblockMillis != 0)  && (nextMotionUnblockMillis < millis())) {
+        Serial.println("ALL DONE Blocking Motion Interrupts!");
+        nextMotionUnblockMillis = 1;
+        BMI160.setIntMotionEnabled(true);
+    }
+
+    // doing this here so we are not doing stuff during an interrupt
+    if (motionWasTriggered) {
+        Serial.print("MOTION! one-shot! (Update display, Set up for dsp OFF: ");
+        Serial.print(MOTION_DISPLAY_MS);
+        Serial.print("ms  and int back en after  ");
+        Serial.println(AFTER_MOTION_IGNORE_MS);
+        Serial.print("ms");
+        motionDisplayNextOffMillis = millis() + MOTION_DISPLAY_MS;
+        nextMotionUnblockMillis = millis() + AFTER_MOTION_IGNORE_MS;
+        motionWasTriggered = false;
+        updateTouchDisplay();
+    }
+
+    if ((motionDisplayNextOffMillis != 0) && motionDisplayNextOffMillis < millis()) {
+        Serial.println("Turn off Temporary display");
+        motionDisplayNextOffMillis = 0;
+        updateTouchDisplay();
+    }
 
 }
 
 void loop() {
     uint32_t sysTick = millis();
 
+    if (motionWasTriggered) {
+        BMI160.setIntMotionEnabled(false);
+    }
     // ----- simpleEspConnection Handling ------
     // needed to manage the communication in the background!
     simpleEspConnection.loop();
@@ -584,7 +724,7 @@ void loop() {
     }
 
     avgSpeed.reading(analogRead(SPEED_CONTROL_POT_PIN));
-    //avgRightTouch.reading(touchRead(BUTTON_RIGHT_TOUCH_PIN));
+    avgRightTouch.reading(touchRead(BUTTON_RIGHT_TOUCH_PIN));
 
     //if(sysTick - tick16 > 16){
     //  tick16 = sysTick;
@@ -599,7 +739,6 @@ void loop() {
       tick30000 = sysTick;
       task30s();
     }
-
 
     // ----- Serial Commands Handling  (should go away?) ------
     while (Serial.available()) {
