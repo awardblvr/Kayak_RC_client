@@ -30,9 +30,9 @@
 #include <vector>
 #include <movingAvg.h>                  // https://github.com/JChristensen/movingAvg
 
+//#define STOP_ALL_SERIAL_IO
+#include "debug_serial_print.h"
 
-#define debug(x) Serial.print(x)
-#define debugln(x) Serial.println(x)
 
 //ESP32-S2-TFT   7C:DF:A1:95:0C:6E
 
@@ -228,7 +228,7 @@ void updateTouchDisplay(void)
             tft.print("  MOTION");
         }
     } else {
-        Serial.println("touchUpdateHoldoff!  Skipping display update");
+        debug_pln("touchUpdateHoldoff!  Skipping display update");
     }
 
 }
@@ -255,7 +255,7 @@ void onLeftPressShortRelease(void)
     lastActionMillis = millis();
 
     digitalWrite(NEOPIXEL_POWER, 1);
-    Serial.println("Short Left Press");
+    debug_pln("Short Left Press");
     pixel.clear();
     pixel.setPixelColor(0, pixel.Color(150, 0, 150));
     pixel.show();
@@ -281,7 +281,7 @@ void onLeftPressLongStart(void)
 {
     lastActionMillis = millis();
 
-    Serial.println("Long Left Press");
+    debug_pln("Long Left Press");
     pixel.clear();
     pixel.setPixelColor(0, pixel.Color(150, 0, 0));
     pixel.show();
@@ -292,7 +292,7 @@ void onLeftPressLongStart(void)
 
 void onRightPressShortRelease(void)
 {
-    Serial.println("Short Right Press");
+    debug_pln("Short Right Press");
     pixel.clear();
     pixel.show();
 
@@ -309,10 +309,10 @@ void onRightPressLongRelease(void)
     pixel.show();
     digitalWrite(NEOPIXEL_POWER, 0);
 
-    Serial.println("Long Right Press");
+    debug_pln("Long Right Press");
 
     if (buttonLeft.isPressed()) {
-        Serial.println("Initiating Reboot Sequence");
+        debug_pln("Initiating Reboot Sequence");
         for (int i=4; i; i--){
             clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
             tft.setTextColor(ST77XX_RED);
@@ -326,7 +326,7 @@ void onRightPressLongRelease(void)
 void onSwitchForward(void)
 {
     lastActionMillis = millis();
-    Serial.println("onSwitchForward!");
+    debug_pln("onSwitchForward!");
     motorSwitch = 1;
     clearSizedTextLine(DISP_ADDR_LINE_SIZE, DISP_ADDR_LINE_PIXEL);
     updateGearStateDisplay();
@@ -335,7 +335,7 @@ void onSwitchForward(void)
 void onSwitchForwardRelease(void)
 {
     lastActionMillis = millis();
-    Serial.println("onSwitchForwardRelease!");
+    debug_pln("onSwitchForwardRelease!");
     motorSwitch = 0;
     updateGearStateDisplay();
 }
@@ -343,7 +343,7 @@ void onSwitchForwardRelease(void)
 void onSwitchReverse(void)
 {
     lastActionMillis = millis();
-    Serial.println("onSwitchReverse!");
+    debug_pln("onSwitchReverse!");
     motorSwitch = 2;
     clearSizedTextLine(DISP_ADDR_LINE_SIZE, DISP_ADDR_LINE_PIXEL);
     updateGearStateDisplay();
@@ -352,7 +352,7 @@ void onSwitchReverse(void)
 void onSwitchReverseRelease(void)
 {
     lastActionMillis = millis();
-    Serial.println("onSwitchReverseRelease!");
+    debug_pln("onSwitchReverseRelease!");
     motorSwitch = 0;
     updateGearStateDisplay();
 }
@@ -360,7 +360,7 @@ void onSwitchReverseRelease(void)
 
 void bmi160_intr(void)
 {
-    Serial.println("BMI160 interrupt: MOTION?");
+    debug_pln("BMI160 interrupt: MOTION?");
     motionWasTriggered = true;
     // unblock motion interrupts after 30 sec
     //nextMotionUnblockMillis = millis() + AFTER_MOTION_IGNORE_MS;
@@ -389,15 +389,15 @@ void check_IMU(void)
     gx = convertRawGyro(gxRaw);
     gy = convertRawGyro(gyRaw);
     gz = convertRawGyro(gzRaw);
-    
+
     // display tab-separated gyro x/y/z values
-    Serial.print("g:\t");
-    Serial.print(gx);
-    Serial.print("\t");
-    Serial.print(gy);
-    Serial.print("\t");
-    Serial.print(gz);
-    Serial.println();
+    debug_p("g:\t");
+    debug_p(gx);
+    debug_p("\t");
+    debug_p(gy);
+    debug_p("\t");
+    debug_p(gz);
+    debug_pln();
 
 }
 
@@ -448,7 +448,7 @@ bool sendStructMessage() {
 }
 
 void OnSendError(uint8_t * ad) {
-  Serial.println("SENDING TO '" + simpleEspConnection.macToStr(ad) + "' WAS NOT POSSIBLE!");
+  debug_pln("SENDING TO '" + simpleEspConnection.macToStr(ad) + "' WAS NOT POSSIBLE!");
 }
 
 void OnMessage(uint8_t * ad,
@@ -458,17 +458,18 @@ void OnMessage(uint8_t * ad,
     struct_message myData;
 
     memcpy( & myData, message, len);
-    Serial.printf("Structure:\n");
-    Serial.printf("a:%s\n", myData.a);
-    Serial.printf("b:%d\n", myData.b);
-    Serial.printf("c:%f\n", myData.c);
-    Serial.printf("e:%s\n", myData.e ? "true" : "false");
-  } else
-    Serial.printf("MESSAGE:[%d]%s from %s\n", len, (char * ) message, simpleEspConnection.macToStr(ad).c_str());
+    //Serial.printf("Structure:\n");
+    //Serial.printf("a:%s\n", myData.a);
+    //Serial.printf("b:%d\n", myData.b);
+    //Serial.printf("c:%f\n", myData.c);
+    //Serial.printf("e:%s\n", myData.e ? "true" : "false");
+  } else {
+    //Serial.printf("MESSAGE:[%d]%s from %s\n", len, (char * ) message, simpleEspConnection.macToStr(ad).c_str());
+  }
 }
 
 void OnNewGatewayAddress(uint8_t * ga, String ad) {
-  Serial.println("New GatewayAddress '" + ad + "'");
+  debug_pln("New GatewayAddress '" + ad + "'");
   serverAddress = ad;
 
   simpleEspConnection.setServerMac(ga);
@@ -479,9 +480,9 @@ void OnNewGatewayAddress(uint8_t * ga, String ad) {
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n");
+    debug_pln("\n");
     delay(1500);  // 400 required for ESP8266 "D1 Mini Pro"
-    Serial.print("\nClient Setup...Client address: ");
+    debug_p("\nClient Setup...Client address: ");
 
     // ---------------------- TFT Screen Prep ------------------------
     // turn on backlite
@@ -510,13 +511,13 @@ void setup() {
         tft.setTextColor(ST77XX_RED);
         snprintf(tft_lin_buf, sizeof(tft_lin_buf), "NOT FINDING LC709203F! Batt unplugged??");
         tft.println( tft_lin_buf );
-        Serial.println(F("Couldn't find Adafruit LC709203F?\nMake sure a battery is plugged in!"));
+        debug_pln(F("Couldn't find Adafruit LC709203F?\nMake sure a battery is plugged in!"));
     } else {
-        Serial.println(F("Found LC709203F"));
-        Serial.print("Version: 0x"); Serial.println(lc.getICversion(), HEX);
+        debug_pln(F("Found LC709203F"));
+        debug_p("Version: 0x"); debug_pln(lc.getICversion(), HEX);
 
         lc.setThermistorB(3950);
-        Serial.print("Thermistor B = "); Serial.println(lc.getThermistorB());
+        debug_p("Thermistor B = "); debug_pln(lc.getThermistorB());
 
         //   LC709203F_APA_500MAH = 0x10,
         //   LC709203F_APA_1000MAH = 0x19,
@@ -533,12 +534,12 @@ void setup() {
     }
 
     // ---------------------- BMI160 IMU (Accelerometer/Gyro) Initialization ------------------------
-    Serial.println("Initializing IMU device...");
+    debug_pln("Initializing IMU device...");
     //BMI160.begin(BMI160GenClass::SPI_MODE, /* SS pin# = */10);
     BMI160.begin(BMI160GenClass::I2C_MODE, I2C_ADDR_ACCEL_BMI160, ACCEL_INT_1_PIN);
     uint8_t dev_id = BMI160.getDeviceID();
-    Serial.print("IMU DEVICE ID: ");
-    Serial.println(dev_id, HEX);
+    debug_p("IMU DEVICE ID: ");
+    debug_pln(dev_id, HEX);
 
     BMI160.attachInterrupt(bmi160_intr);
     //BMI160.setIntTapEnabled(true);
@@ -546,29 +547,29 @@ void setup() {
      // Set the accelerometer range to 250 degrees/second
     BMI160.setGyroRange(250);
 
-    Serial.println("IMU: setIntMotionEnabled...");
+    debug_pln("IMU: setIntMotionEnabled...");
     BMI160.setIntMotionEnabled(true);
 
     // FullScaleGyroRange default:  3 = +/-  250 degrees/sec
-    Serial.print("IMU: getFullScaleGyroRange:");
-    Serial.print(BMI160.getFullScaleGyroRange());
-    Serial.print(", IntMotionEnabled:");
-    Serial.print(BMI160.getIntMotionEnabled());
-    Serial.print(", Orig MotionDetectionThreshold:");
-    Serial.print(BMI160.getMotionDetectionThreshold());
-    Serial.println();
+    debug_p("IMU: getFullScaleGyroRange:");
+    debug_p(BMI160.getFullScaleGyroRange());
+    debug_p(", IntMotionEnabled:");
+    debug_p(BMI160.getIntMotionEnabled());
+    debug_p(", Orig MotionDetectionThreshold:");
+    debug_p(BMI160.getMotionDetectionThreshold());
+    debug_pln();
 
     BMI160.setMotionDetectionThreshold(150.0);
 
-    Serial.print("NEW MotionDetectionThreshold:");
-    Serial.print(BMI160.getMotionDetectionThreshold());
-    // Serial.print(", FullScaleAccelRange: ");
-    // Serial.print(BMI160.getFullScaleAccelRange());
-    // Serial.print(", [MotionDetectionDuration: ");
-    // Serial.print(BMI160.getMotionDetectionDuration());
-    // Serial.print("]");
-    Serial.println();
-    Serial.println("Initializing IMU device...done.");
+    debug_p("NEW MotionDetectionThreshold:");
+    debug_p(BMI160.getMotionDetectionThreshold());
+    // debug_p(", FullScaleAccelRange: ");
+    // debug_p(BMI160.getFullScaleAccelRange());
+    // debug_p(", [MotionDetectionDuration: ");
+    // debug_p(BMI160.getMotionDetectionDuration());
+    // debug_p("]");
+    debug_pln();
+    debug_pln("Initializing IMU device...done.");
 
     // ---------------------- simpleEspConnection (comms initialization) ------------------------
 
@@ -582,7 +583,7 @@ void setup() {
     simpleEspConnection.onSendError( & OnSendError);
     simpleEspConnection.onMessage( & OnMessage);
 
-    Serial.println("I'm the client! My MAC address is " + WiFi.macAddress());
+    debug_pln("I'm the client! My MAC address is " + WiFi.macAddress());
     clientAddress = WiFi.macAddress();
 
     // Remove ':' from address string
@@ -595,7 +596,7 @@ void setup() {
         }
         tmpClientAddr += clientAddress.charAt(x++);
     }
-    Serial.println("My Cleaned MAC address is " + tmpClientAddr);
+    debug_pln("My Cleaned MAC address is " + tmpClientAddr);
 
     tft.setTextColor(ST77XX_YELLOW);
     tft.setTextSize(2);
@@ -640,8 +641,8 @@ void task128ms(void)
     motorSpeedPotVal = avgSpeed.getAvg();
     float diffVal =     motorSpeedPotVal-lastMotorSpeedPotVal;
     float percentChange = (diffVal/lastMotorSpeedPotVal) * 100.0;
-    //Serial.print("motorSpeedPotVal="+String(motorSpeedPotVal)+ "   lastMotorSpeedPotVal="+ String(lastMotorSpeedPotVal));
-    //Serial.print("  diffVal="+ String(diffVal) + ", change(%):" + String(percentChange));
+    //debug_p("motorSpeedPotVal="+String(motorSpeedPotVal)+ "   lastMotorSpeedPotVal="+ String(lastMotorSpeedPotVal));
+    //debug_p("  diffVal="+ String(diffVal) + ", change(%):" + String(percentChange));
     if ( abs(percentChange) > 2.0 ) {
         //Serial.println(" Update");
         lastActionMillis = millis();
@@ -676,18 +677,18 @@ void task128ms(void)
         // WHAT ?? Serial.println("")
 
     } else if ( (nextMotionUnblockMillis != 0)  && (nextMotionUnblockMillis < millis())) {
-        Serial.println("ALL DONE Blocking Motion Interrupts!");
+        debug_pln("ALL DONE Blocking Motion Interrupts!");
         nextMotionUnblockMillis = 1;
         BMI160.setIntMotionEnabled(true);
     }
 
     // doing this here so we are not doing stuff during an interrupt
     if (motionWasTriggered) {
-        Serial.print("MOTION! one-shot! (Update display, Set up for dsp OFF: ");
-        Serial.print(MOTION_DISPLAY_MS);
-        Serial.print("ms  and int back en after  ");
-        Serial.println(AFTER_MOTION_IGNORE_MS);
-        Serial.print("ms");
+        debug_p("MOTION! one-shot! (Update display, Set up for dsp OFF: ");
+        debug_p(MOTION_DISPLAY_MS);
+        debug_p("ms  and int back en after  ");
+        debug_pln(AFTER_MOTION_IGNORE_MS);
+        debug_p("ms");
         motionDisplayNextOffMillis = millis() + MOTION_DISPLAY_MS;
         nextMotionUnblockMillis = millis() + AFTER_MOTION_IGNORE_MS;
         motionWasTriggered = false;
@@ -695,7 +696,7 @@ void task128ms(void)
     }
 
     if ((motionDisplayNextOffMillis != 0) && motionDisplayNextOffMillis < millis()) {
-        Serial.println("Turn off Temporary display");
+        debug_pln("Turn off Temporary display");
         motionDisplayNextOffMillis = 0;
         updateTouchDisplay();
     }
@@ -744,7 +745,7 @@ void loop() {
     while (Serial.available()) {
         char inChar = (char) Serial.read();
         if (inChar == '\n') {
-            Serial.println(inputString);
+            debug_pln(inputString);
 
             if (inputString == "startpair") {
                 simpleEspConnection.startPairing(30);
@@ -756,15 +757,15 @@ void loop() {
                 simpleEspConnection.setPairingMac(np);
             } else if (inputString == "textsend") {
                 if (!simpleEspConnection.sendMessage("This comes from the Client")) {
-                    Serial.println("SENDING TO '" + serverAddress + "' WAS NOT POSSIBLE!");
+                    debug_pln("SENDING TO '" + serverAddress + "' WAS NOT POSSIBLE!");
                 }
             } else if (inputString == "structsend") {
                 if (!sendStructMessage()) {
-                    Serial.println("SENDING TO '" + serverAddress + "' WAS NOT POSSIBLE!");
+                    debug_pln("SENDING TO '" + serverAddress + "' WAS NOT POSSIBLE!");
                 }
             } else if (inputString == "bigsend") {
                 if (!sendBigMessage()) {
-                    Serial.println("SENDING TO '" + serverAddress + "' WAS NOT POSSIBLE!");
+                    debug_pln("SENDING TO '" + serverAddress + "' WAS NOT POSSIBLE!");
                 }
             }
 
