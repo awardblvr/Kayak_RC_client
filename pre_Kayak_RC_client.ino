@@ -28,28 +28,49 @@
 #include <Adafruit_NeoPixel.h>
 #include <BMI160Gen.h>
 #include <vector>
+#include <forward_list>
 #include <movingAvg.h>                  // https://github.com/JChristensen/movingAvg
-
 //#define STOP_ALL_SERIAL_IO
 #include "debug_serial_print.h"
+#include "shared_yak_messaging.h"
 
 
-//ESP32-S2-TFT   7C:DF:A1:95:0C:6E
+
+
+
+typedef struct {
+    uint32_t color0;
+    uint32_t color1;
+    uint32_t durationMillis;
+    uint8_t flashes;
+    uint8_t current_color;    // always 0 (color0) or 1 (color1)
+    uint32_t nextChangeMillis;
+} PixelFlashEvent_t;
+std::forward_list<PixelFlashEvent_t> PixelFlashEvents {};
+PixelFlashEvent_t pixelAction;
+#define PIXEL_TRIG_NOW 1
+
+// MY ADDRESS! ESP32-S2-TFT   7C:DF:A1:95:0C:6E
+//   serverAddress = "AC0BFBDCE1F1"; // Test if you know the server
+//   serverAddress = "AC0BFBDD4100"; // Initial trial w/ WeMos D1Mini Pro
+//   serverAddress = "A0764E5ADF70"; // ESP32-C3-mini-1 (board is ESP32-C3-DevKitM-1)
+#define SERVER_ADDRESS "A0764E5ADF70"
+
+
 
 //  Use RTC_DATA_ATT as a prefix to any var below to save in RTC Ram
 //  (not lost uin sleep modes, but resets on full power-cycle  or reboot
 String inputString;
 String serverAddress;
 String clientAddress;  // This is me
-uint8_t motorSwitch=0;   // Motor switch state: 0=Neutral, 1=Forward, 2=Reverse, all else invalid, (like 0)
-std::vector<String> gear{ "NEUTRAL", "FORWARD", "REVERSE" };
+//std::vector<String> gear{ "NEUTRAL", "FORWARD", "REVERSE" };   Replaced by GEAR_t_v
 char tft_lin_buf[50];
 uint16_t motorSpeedPotVal=0;
 uint16_t lastMotorSpeedPotVal=1;
 uint8_t motorSpeedPercent=0;
 //static void task16ms();
 //static void task128ms();
-static uint32_t tick16=0, tick128=0, tick30000=0;
+static uint32_t tick50=0, tick128=0, tick30000=0;
 uint16_t maxPotAdcVal=5000;  // used in scaling, adjusts higher if new value is higher
 uint32_t lastActionMillis=0;
 int avgRightTouchVal=1, lastAvgRightTouchVal=1;
@@ -58,6 +79,13 @@ bool LC709203FisOK = false;
 uint32_t nextMotionUnblockMillis=0;
 uint32_t motionDisplayNextOffMillis=0;
 bool motionWasTriggered=false;
+bool wifiIsUp=false;
+bool yakMessageUpdated = false;
+uint32_t msgIDcounter=0;
+GEAR_t motorSwitch=NEUTRAL;
+GEAR_t lastMotorSwitch=motorSwitch;
+
+// uint8_t motorSwitch=0;   // Motor switch state: 0=Neutral, 1=Forward, 2=Reverse, all else invalid, (like 0)
 
 #define DEFAULT_I2C_PORT &Wire
 
@@ -101,9 +129,35 @@ EasyButton buttonLeft(BUTTON_LEFT_PIN);
 EasyButton switchForward(SWITCH_FORWARD_PIN);
 EasyButton switchReverse(SWITCH_REVERSE_PIN);
 
-int buttonRightTOUCHval = 0;
+// ---------------------- Yak Messaging for ESP NOW  ------------------------
+
+yakMessage_t yakMessage = { YAK,        // msgType
+                            0,          // msgID  <future> to track messages lost or ensure/check ordering
+                            PING,       // action
+                            NEUTRAL,    // gear
+                            0           // speed (0-100)
+                          };   // A default message
+
 
 // -------------------
+
+// Neopixel colors
+#define NeoBlack    0x000000
+#define NeoWhite    0xFFFFFF
+#define NeoRed      0xFF0000
+#define NeoGreen    0x00FF00
+#define NeoBlue     0x0000FF
+#define NeoYellow   0xFFFF00
+#define NeoMagenta  0xFF00FF
+#define NeoPurple   0x800080
+#define NeoOrange   0xFF8C00
+#define NeoLime     0x00FF00
+#define NeoNavyBlue 0x000080
+#define NeoGray     0x696969
+#define NeoSilver   0xC0C0C0
+
+void flash_pixel(uint32_t color0, uint8_t flashes=1, uint32_t duration=500, uint32_t color1=NeoBlack);
+
 
 /* TFT Color Choices:
   ST77XX_BLACK
@@ -133,6 +187,7 @@ void lineLocator(int8_t fontSize, int8_t pixelLine, int8_t chars=0)
     tft.print(char(0xDA)); // 0xDA is the CP437(false) square block
 }
 
+
 void clearTextLine(int8_t chars, bool debug=false)
 {
 
@@ -146,15 +201,14 @@ void clearTextLine(int8_t chars, bool debug=false)
     }
 }
 
-/*
-  size 1:   i=41 for char(0xDA)
-  size 2:   i=21 for char(0xDA)
-  size 3:   i=14 for char(0xDA)
-*/
+
 void clearSizedTextLine(int8_t fontSize, int8_t pixelLine, bool debug=false)
 {
     int chars=0;
 
+    // size 1:   i=41 for char(0xDA)
+    // size 2:   i=21 for char(0xDA)
+    // size 3:   i=14 for char(0xDA)
     switch (fontSize) {
         case 1:
             chars=41;
@@ -187,13 +241,13 @@ void updateGearStateDisplay(void)
 {
     uint16_t color = ST77XX_ORANGE;  // orange means this is unexpected
     switch (motorSwitch) {
-    case 0:
+    case NEUTRAL:
         color = ST77XX_YELLOW;
         break;
-    case 1:
+    case FORWARD:
         color = ST77XX_GREEN;
         break;
-    case 2:
+    case REVERSE:
         color = ST77XX_RED;
         break;
     default:
@@ -204,11 +258,9 @@ void updateGearStateDisplay(void)
 
     clearSizedTextLine(DISP_GEAR_SIZE, DISP_GEAR_LINE_PIXEL);
     tft.setTextColor(color);
-    tft.print(gear[motorSwitch]);
+    tft.print(GEAR_t_v[motorSwitch]);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(" " + String(motorSpeedPercent));
-
-
 }
 
 void updateTouchDisplay(void)
@@ -230,8 +282,8 @@ void updateTouchDisplay(void)
     } else {
         debug_pln("touchUpdateHoldoff!  Skipping display update");
     }
-
 }
+
 
 void updateBatteryDisplay(void)
 {
@@ -254,11 +306,17 @@ void onLeftPressShortRelease(void)
 {
     lastActionMillis = millis();
 
+    debug_pln("Short Left Press (TFT Backlight ON)");
     digitalWrite(NEOPIXEL_POWER, 1);
-    debug_pln("Short Left Press");
+    delay(20);
     pixel.clear();
-    pixel.setPixelColor(0, pixel.Color(150, 0, 150));
+    pixel.setPixelColor(0, pixel.Color(10, 0, 10));
     pixel.show();
+
+    digitalWrite(TFT_BACKLITE, HIGH);
+
+    updateGearStateDisplay();
+    updateBatteryDisplay();
 
     //lineLocator(2, 13);
     //lineLocator(2, 14, 1);
@@ -268,39 +326,47 @@ void onLeftPressShortRelease(void)
     //lineLocator(3, 14, 7);
     //lineLocator(3, 15, 9);
 
-    touchUpdateHoldoff = true;
-    digitalWrite(TFT_BACKLITE, LOW);
-
-    delay(500);
-    updateGearStateDisplay();
-    updateBatteryDisplay();
-
 }
+
 
 void onLeftPressLongStart(void)
 {
     lastActionMillis = millis();
 
-    debug_pln("Long Left Press");
-    pixel.clear();
-    pixel.setPixelColor(0, pixel.Color(150, 0, 0));
-    pixel.show();
+    debug_pln("Long Left Press (TFT Backlight + Pixel OFF)");
 
+    touchUpdateHoldoff = true;
 
-    tft.fillScreen(ST77XX_BLACK);
+    digitalWrite(NEOPIXEL_POWER, 0);
+
+    clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
+    for (int i=2; i; i--){
+        tft.setTextColor(ST77XX_RED);
+        tft.print("BL OFF in " + String(i));
+        //clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
+        delay(1000);
+        clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
+    }
+
+    digitalWrite(TFT_BACKLITE, LOW);
+
+    //pixel.clear();
+    //pixel.setPixelColor(0, pixel.Color(150, 0, 0));
+    //pixel.show();
+
+    //tft.fillScreen(ST77XX_BLACK);
 }
 
 void onRightPressShortRelease(void)
 {
-    debug_pln("Short Right Press");
-    pixel.clear();
-    pixel.show();
+    debug_pln("Short Right Press (nothing)");
 
-    digitalWrite(TFT_BACKLITE, HIGH);
+    flash_pixel(NeoPurple, 3);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=250,uint32_t color1=NeoBlack)
 
     touchUpdateHoldoff = false;
 
 }
+
 
 void onRightPressLongRelease(void)
 {
@@ -309,10 +375,10 @@ void onRightPressLongRelease(void)
     pixel.show();
     digitalWrite(NEOPIXEL_POWER, 0);
 
-    debug_pln("Long Right Press");
+    debug_pln("Long Right Press (Possible reboot...)");
 
     if (buttonLeft.isPressed()) {
-        debug_pln("Initiating Reboot Sequence");
+        debug_pln("Long Right Press w/ Left (Initiating Reboot Sequence)");
         for (int i=4; i; i--){
             clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
             tft.setTextColor(ST77XX_RED);
@@ -323,37 +389,41 @@ void onRightPressLongRelease(void)
     }
 }
 
+
 void onSwitchForward(void)
 {
     lastActionMillis = millis();
     debug_pln("onSwitchForward!");
-    motorSwitch = 1;
+    motorSwitch = FORWARD;
     clearSizedTextLine(DISP_ADDR_LINE_SIZE, DISP_ADDR_LINE_PIXEL);
     updateGearStateDisplay();
 }
+
 
 void onSwitchForwardRelease(void)
 {
     lastActionMillis = millis();
     debug_pln("onSwitchForwardRelease!");
-    motorSwitch = 0;
+    motorSwitch = NEUTRAL;
     updateGearStateDisplay();
 }
+
 
 void onSwitchReverse(void)
 {
     lastActionMillis = millis();
     debug_pln("onSwitchReverse!");
-    motorSwitch = 2;
+    motorSwitch = REVERSE;
     clearSizedTextLine(DISP_ADDR_LINE_SIZE, DISP_ADDR_LINE_PIXEL);
     updateGearStateDisplay();
 }
+
 
 void onSwitchReverseRelease(void)
 {
     lastActionMillis = millis();
     debug_pln("onSwitchReverseRelease!");
-    motorSwitch = 0;
+    motorSwitch = NEUTRAL;
     updateGearStateDisplay();
 }
 
@@ -367,6 +437,7 @@ void bmi160_intr(void)
     //BMI160.setIntMotionEnabled(false);
 }
 
+
 float convertRawGyro(int gRaw) {
     // since we are using 250 degrees/seconds range
     // -250 maps to a raw value of -32768
@@ -376,6 +447,7 @@ float convertRawGyro(int gRaw) {
 
     return g;
 }
+
 
 void check_IMU(void)
 {
@@ -401,79 +473,176 @@ void check_IMU(void)
 
 }
 
-// Notes:
-//    My Adafruit Feather ES:32-S2 TFT  mac address is 7C:DF:A1:95:0C:6E   This is the CLIENT (This code)
-//    For Debug, the initial WeMos D1Mini Pro SERVER is AC:0B:FB:DD:41:00
 
-typedef struct struct_message {
-  char type;
-  char a[32];
-  int b;
-  float c;
-  bool e;
-} struct_message;
+bool sendYakMessage()
+{
+    yakMessage_t sendableMessage = yakMessage;
 
-typedef struct yak_message {
-    uint32_t    msg_id;
-    enum action { PING, MOTOR_CONTROL, BATTERY_CHECK, BATTERY_MESSAGING, NEW_CLIENT_MAC, BLUETOOTH_PAIR };
-    enum gear { NEUTRAL, FORWARD, REVERSE };
-    uint8_t     speed;  // (0-100)
-} yak_message_t;
-
-bool sendBigMessage() {
-  char bigMessage[] = "\n\
-There was once a woman who was very, very cheerful, though she had little to make her so; for she was old, and poor, and lonely. She lived in a little bit of a cottage and earned a scant living by running errands for her neighbours, getting a bite here, a sup there, as reward for her services. So she made shift to get on, and always looked as spry and cheery as if she had not a want in the world.\n\
-Now one summer evening, as she was trotting, full of smiles as ever, along the high road to her hovel, what should she see but a big black pot lying in the ditch!\n\
-\"Goodness me!\" she cried, \"that would be just the very thing for me if I only had something to put in it! But I haven't! Now who could have left it in the ditch?\"\n\
-And she looked about her expecting the owner would not be far off; but she could see nobody.\n\
-\"Maybe there is a hole in it,\" she went on, \"and that's why it has been cast away. But it would do fine to put a flower in for my window; so I'll just take it home with me.\"\n\
-And with that she lifted the lid and looked inside. \"Mercy me!\" she cried, fair amazed. \"If it isn't full of gold pieces. Here's luck!\"\n\
-And so it was, brimful of great gold coins. Well, at first she simply stood stock-still, wondering if she was standing on her head or her heels. Then she began saying:\n\
-\"Lawks! But I do feel rich. I feel awful rich!\"\n\
-";
-
-  return (simpleEspConnection.sendMessage(bigMessage));
+    return (simpleEspConnection.sendMessage((uint8_t * ) & sendableMessage, sizeof(sendableMessage)));
 }
 
-bool sendStructMessage() {
-  struct_message myData;
+void dump_pixelAction(char *prefix, PixelFlashEvent_t pe)
+{
+    char buf[strlen(prefix) + 140];
+    uint32_t current_millis = millis();
 
-  myData.type = '#'; // just to mark first byte. It's on you how to distinguish between struct and text message
-  sprintf(myData.a, "Greetings from %s", simpleEspConnection.myAddress.c_str());
-  myData.b = random(1, 20);
-  myData.c = (float) random(1, 100000) / (float) 10000;
-  myData.e = true;
-
-  return (simpleEspConnection.sendMessage((uint8_t * ) & myData, sizeof(myData)));
+    // "color0-0x        , color1=0x        , dur=       , flashes=  , cur_col=ox        , current_millis=        ,  nextChangeMillis=        ",
+    snprintf(buf, sizeof(buf), "%s color0-0x%lX, color1=0x%lX, dur=%d, flashes=%d, cur_col=%d, current_millis=%ld,  nextChangeMillis=0x%ld",
+              prefix, pe.color0, pe.color1, pe.durationMillis, pe.flashes,
+              pe.current_color, current_millis, pe.nextChangeMillis);
+    debug_pln(buf);
 }
 
-void OnSendError(uint8_t * ad) {
+//void flash_pixel(uint32_t color0, uint8_t flashes, uint32_t duration=250, uint32_t color1=NeoBlack)
+void flash_pixel(uint32_t color0, uint8_t flashes, uint32_t duration, uint32_t color1)
+{
+    /* reference only
+        typedef struct {
+            uint32_t color0;
+            uint32_t color1;
+            uint32_t durationMillis;
+            uint8_t flashes;
+            uint8_t current_color;    // always 0 (color0) or 1 (color1)
+            uint32_t nextChangeMillis;
+        } PixelFlashEvent_t;
+        std::forward_list<PixelFlashEvent_t> PixelFlashEvents {};
+    */
+
+    //PixelFlashEvents.push_front({color0, color1, duration, flashes, NeoBlack, 1});
+    pixelAction = {color0, color1, duration, flashes, NeoBlack, PIXEL_TRIG_NOW};
+    //dump_pixelAction("@instant: ", pixelAction);
+}
+
+void OnSendError(uint8_t * ad)
+{
   debug_pln("SENDING TO '" + simpleEspConnection.macToStr(ad) + "' WAS NOT POSSIBLE!");
+
 }
 
-void OnMessage(uint8_t * ad,
-  const uint8_t * message, size_t len) {
-  if ((char) message[0] == '#') // however you distinguish....
-  {
-    struct_message myData;
 
-    memcpy( & myData, message, len);
-    //Serial.printf("Structure:\n");
-    //Serial.printf("a:%s\n", myData.a);
-    //Serial.printf("b:%d\n", myData.b);
-    //Serial.printf("c:%f\n", myData.c);
-    //Serial.printf("e:%s\n", myData.e ? "true" : "false");
-  } else {
-    //Serial.printf("MESSAGE:[%d]%s from %s\n", len, (char * ) message, simpleEspConnection.macToStr(ad).c_str());
-  }
+void OnMessage(uint8_t * ad, const uint8_t * message, size_t len)
+{
+    //debug_pln("Got Something!");
+    char buf[100];
+    snprintf(buf, sizeof(buf), "Got Something! MESSAGE:[%d]%s from %s\n", len, (char * ) message, simpleEspConnection.macToStr(ad).c_str());
+    debug_pln(String(buf));
+
+    if ((char) message[0] == '#') { // however you distinguish....
+        //struct_message myData;
+        //
+        //memcpy( & myData, message, len);
+        //Serial.printf("Structure:\n");
+        //Serial.printf("a:%s\n", myData.a);
+        //Serial.printf("b:%d\n", myData.b);
+        //Serial.printf("c:%f\n", myData.c);
+        //Serial.printf("e:%s\n", myData.e ? "true" : "false");
+    } else {
+        //Serial.printf("MESSAGE:[%d]%s from %s\n", len, (char * ) message, simpleEspConnection.macToStr(ad).c_str());
+    }
 }
 
-void OnNewGatewayAddress(uint8_t * ga, String ad) {
-  debug_pln("New GatewayAddress '" + ad + "'");
-  serverAddress = ad;
 
-  simpleEspConnection.setServerMac(ga);
+void OnNewGatewayAddress(uint8_t * ga, String ad)
+{
+    debug_pln("New GatewayAddress '" + ad + "'");
+    serverAddress = ad;
+
+    simpleEspConnection.setServerMac(ga);
 }
+
+void OnConnected(uint8_t *ga, String ad)
+{
+    debug_pln("OnConnected function called");
+    // if(newTimeout != "") {
+    //   simpleEspConnection.sendMessage((char *)(String("timeout:"+newTimeout).c_str()), ad );
+    //   newTimeout = "";
+    // }
+}
+
+
+// ---------------------- simpleEspConnection (comms initialization) ------------------------
+void connectionStart(void)
+{
+    bool simpleConncectIsOK = simpleEspConnection.begin();   // true == OK, false == error
+
+    if (! simpleConncectIsOK) {
+        debug_pln("ERROR - simpleEspConnection begin FAILED");
+    }
+    //  simpleEspConnection.setPairingBlinkPort(2);
+    serverAddress = SERVER_ADDRESS ; // Address discovered by manual pairing
+    simpleEspConnection.setServerMac(serverAddress);
+    simpleEspConnection.onNewGatewayAddress( & OnNewGatewayAddress);
+    simpleEspConnection.onSendError( & OnSendError);
+    simpleEspConnection.onMessage( & OnMessage);
+    simpleEspConnection.onConnected( & OnConnected);
+
+
+    wifiIsUp = true;
+}
+
+/*
+ * Stuff that I can do :
+ * WiFi. members:
+ *     static wifi_mode_t getMode();
+ *     bool setSleep(bool enabled);
+ *     bool setSleep(wifi_ps_type_t sleepType);
+ *     wifi_ps_type_t getSleep();
+ *     bool setTxPower(wifi_power_t power);
+ *     wifi_power_t getTxPower();
+ *
+ *      See /Users/andrewward/Library/Arduino15/packages/esp32/hardware/esp32/2.0.5/libraries/WiFi/examples/WiFiScan/WiFiScan.ino
+ *
+ *     Getting rssi:  (CANNOT FIND ANY MATCHES)
+ *     You have to call the ESP API directly. E.g. see here for the esp8266 API: https://www.espressif.com/sites/default/files/documentation/2c-esp8266_non_os_sdk_api_reference_en.pdf
+ *     Functions: wifi_station_get_ap_info and wifi_station_get_current_ap_id should work
+ *
+ */
+
+void connectionSleep()
+{
+    WiFi.disconnect();
+    WiFi.mode(WIFI_OFF);
+}
+
+
+void connectionWake()
+{
+    connectionStart();
+}
+
+/*
+
+Wifi shutdown, restart ideas:
+
+esp_now_deinit();
+WiFi.disconnect();
+WiFi.mode(WIFI_OFF);
+WiFi.forceSleepBegin();
+
+
+void enableWiFi(){
+    adc_power_on();
+    WiFi.disconnect(false);  // Reconnect the network
+    WiFi.mode(WIFI_STA);    // Switch WiFi off
+
+    Serial2.println("START WIFI");
+    WiFi.begin(STA_SSID, STA_PASS);
+
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial2.print(".");
+    }
+
+    Serial2.println("");
+    Serial2.println("WiFi connected");
+    Serial2.println("IP address: ");
+    Serial2.println(WiFi.localIP());
+}
+
+*/
+
+
+
 
 
 
@@ -481,7 +650,9 @@ void OnNewGatewayAddress(uint8_t * ga, String ad) {
 void setup() {
     Serial.begin(115200);
     debug_pln("\n");
+# if !defined(STOP_ALL_SERIAL_IO)
     delay(1500);  // 400 required for ESP8266 "D1 Mini Pro"
+#endif
     debug_p("\nClient Setup...Client address: ");
 
     // ---------------------- TFT Screen Prep ------------------------
@@ -572,18 +743,13 @@ void setup() {
     debug_pln("Initializing IMU device...done.");
 
     // ---------------------- simpleEspConnection (comms initialization) ------------------------
+    uint32_t wiFiUpMillis=0;
+    uint32_t wiFiStartMillis = millis();
+    connectionStart();
+    wiFiUpMillis=millis();
+    debug_pln("Wifi startup time: " + String(wiFiUpMillis - wiFiStartMillis) + " ms");
 
-    simpleEspConnection.begin();
-    //  simpleEspConnection.setPairingBlinkPort(2);
-
-    //   serverAddress = "AC0BFBDCE1F1"; // Test if you know the server
-    serverAddress = "AC0BFBDD4100"; // Address discovered by manual pairing
-    simpleEspConnection.setServerMac(serverAddress);
-    simpleEspConnection.onNewGatewayAddress( & OnNewGatewayAddress);
-    simpleEspConnection.onSendError( & OnSendError);
-    simpleEspConnection.onMessage( & OnMessage);
-
-    debug_pln("I'm the client! My MAC address is " + WiFi.macAddress());
+    //debug_pln("I'm the client! My MAC address is " + WiFi.macAddress());
     clientAddress = WiFi.macAddress();
 
     // Remove ':' from address string
@@ -596,11 +762,12 @@ void setup() {
         }
         tmpClientAddr += clientAddress.charAt(x++);
     }
-    debug_pln("My Cleaned MAC address is " + tmpClientAddr);
+    debug_pln("My MAC address is " + tmpClientAddr);
 
     tft.setTextColor(ST77XX_YELLOW);
     tft.setTextSize(2);
     tft.println("I'm " + tmpClientAddr);
+    // --- end of simpleEspConnection ----
 
     buttonRight.begin();
     buttonLeft.begin();
@@ -631,12 +798,31 @@ void setup() {
     pixel.show();
 }
 
+void restoreAllNormalDisplay(void)
+{
+    digitalWrite(TFT_BACKLITE, HIGH);
+    updateGearStateDisplay();
+    updateTouchDisplay();
+    updateBatteryDisplay();
+
+}
+
 void task30s(void) {
     updateBatteryDisplay();
 }
 
+void task250ms(void)
+{
+
+}
+
 void task128ms(void)
 {
+    if (yakMessageUpdated) {
+        yakMessage.msgID = ++msgIDcounter;
+        sendYakMessage();
+        yakMessageUpdated = false;
+    }
 
     motorSpeedPotVal = avgSpeed.getAvg();
     float diffVal =     motorSpeedPotVal-lastMotorSpeedPotVal;
@@ -652,8 +838,21 @@ void task128ms(void)
         }
         motorSpeedPercent = map(motorSpeedPotVal, 0, maxPotAdcVal, 0, 100);
         updateGearStateDisplay();
+
+        yakMessage.speed = motorSpeedPercent;
+        yakMessage.action = MOTOR_CONTROL;
+        yakMessageUpdated = true;
+
     } else {
         //Serial.println("");
+    }
+
+    if (motorSwitch != lastMotorSwitch) {
+        yakMessage.gear = motorSwitch;
+        yakMessage.action = MOTOR_CONTROL;
+        yakMessageUpdated = true;
+
+        lastMotorSwitch = motorSwitch;
     }
 
     // Touch Debug/Adjust: Serial.println("Touch Raw: " + String(touchRead(BUTTON_RIGHT_TOUCH_PIN)));
@@ -692,7 +891,8 @@ void task128ms(void)
         motionDisplayNextOffMillis = millis() + MOTION_DISPLAY_MS;
         nextMotionUnblockMillis = millis() + AFTER_MOTION_IGNORE_MS;
         motionWasTriggered = false;
-        updateTouchDisplay();
+        // NOW The Action part.. DO STUFF
+        restoreAllNormalDisplay();
     }
 
     if ((motionDisplayNextOffMillis != 0) && motionDisplayNextOffMillis < millis()) {
@@ -702,6 +902,177 @@ void task128ms(void)
     }
 
 }
+
+//void task50ms(void)
+//{
+//    /* reference only
+//        typedef struct {
+//            uint32_t color0;
+//            uint32_t color1;
+//            uint32_t durationMillis;
+//            uint8_t flashes;
+//            uint8_t current_color;    // always 0 (color0) or 1 (color1)
+//            uint32_t nextChangeMillis;
+//        } PixelFlashEvent_t;
+//        std::forward_list<PixelFlashEvent_t> PixelFlashEvents {};
+//
+//    */
+//
+//    uint32_t current_millis = millis();
+//
+//    for (const auto &PixelFlashEvent : PixelFlashEvents) {
+//        if (PixelFlashEvent.nextChangeMillis <= current_millis  ) {
+//
+//            if (PixelFlashEvent.current_color == 0) {
+//                pixel.setPixelColor(0, PixelFlashEvent.color0);
+//                pixel.show();
+//                PixelFlashEvent.nextChangeMillis = millis() + (PixelFlashEvent.durationMillis / 2);
+//                PixelFlashEvent.current_color += 1;
+//
+//            } else if (PixelFlashEvent.current_color == 1) {
+//                pixel.setPixelColor(0, PixelFlashEvent.color1);
+//                pixel.show();
+//                PixelFlashEvent.nextChangeMillis = millis() + (PixelFlashEvent.durationMillis / 2);
+//                PixelFlashEvent.current_color += 1;
+//                // PixelFlashEvent.flashes = PixelFlashEvent.flashes - 1;
+//
+//            } else if ((PixelFlashEvent.current_color >= 1) {
+//                PixelFlashEvent.flashes += 1;
+//            }
+//        }
+//    }
+//    PixelFlashEvents.remove_if([current_millis](const PixelFlashEvent& PixelFlashEvent) {
+//        return (PixelFlashEvent.nextChangeMillis <=current_millis && PixelFlashEvent.current_color && PixelFlashEvent.flashes <= 0);
+//    });
+//}
+
+
+//void task50ms(void)
+//{
+//    /* reference only
+//        typedef struct {
+//            uint32_t color0;
+//            uint32_t color1;
+//            uint32_t durationMillis;
+//            uint8_t flashes;
+//            uint8_t current_color;    // always 0 (color0) or 1 (color1)
+//            uint32_t nextChangeMillis;
+//        } PixelFlashEvent_t;
+//        std::forward_list<PixelFlashEvent_t> PixelFlashEvents {};
+//
+//          PixelFlashEvents.push_front({color0, color1, duration, flashes, NeoBlack, 1});
+//    */
+//
+//    uint32_t PixelFlashEventsSize=distance(PixelFlashEvents.begin(), PixelFlashEvents.end());
+//    uint32_t current_millis = millis();
+//    char buf[100];
+//    snprintf(buf, sizeof(buf), "BEFORE For, PixelFlashEventsSize=%d", PixelFlashEventsSize );
+//    debug_pln(String(buf));
+//
+//
+//
+//    //
+//    //
+//    //for (const auto &PixelFlashEvent : PixelFlashEvents) {
+//    //    snprintf(buf, sizeof(buf), "Begin For: color0-0x%lX, color1=0x%lX, dur=%d, flashes=%d, cur_col=%d, current_millis=%ld,  nextChangeMillis=0x%ld",
+//    //              PixelFlashEvent.color0, PixelFlashEvent.color1, PixelFlashEvent.durationMillis, PixelFlashEvent.flashes,
+//    //              PixelFlashEvent.current_color, current_millis, PixelFlashEvent.nextChangeMillis);
+//    //    debug_pln(String(buf));
+//    //
+//    //    if (PixelFlashEvent.nextChangeMillis <= current_millis  ) {
+//    //
+//    //        if (PixelFlashEvent.current_color == 0) {
+//    //            debug_pln("In Color 0");
+//    //            pixel.setPixelColor(0, PixelFlashEvent.color0);
+//    //            pixel.show();
+//    //            PixelFlashEvents.push_front({PixelFlashEvent.color0, PixelFlashEvent.color1, PixelFlashEvent.durationMillis,
+//    //                                         PixelFlashEvent.flashes, 1, millis() + (PixelFlashEvent.durationMillis / 2)});
+//    //
+//    //        } else if (PixelFlashEvent.current_color == 1) {
+//    //            debug_pln("In Color 1");
+//    //            pixel.setPixelColor(0, PixelFlashEvent.color1);
+//    //            pixel.show();
+//    //            uint8_t flashCntr = PixelFlashEvent.flashes - 1;
+//    //            uint8_t nextColor;
+//    //            if (flashCntr == 0) {
+//    //                nextColor = PixelFlashEvent.current_color + 1;
+//    //            } else {
+//    //                nextColor = 0;
+//    //            }
+//    //            PixelFlashEvents.push_front({PixelFlashEvent.color0, PixelFlashEvent.color1, PixelFlashEvent.durationMillis,
+//    //                                         flashCntr, nextColor, millis() + (PixelFlashEvent.durationMillis / 2)});
+//    //
+//    //        } else if (PixelFlashEvent.current_color > 1) {
+//    //            debug_pln("In Color >1");
+//    //            //PixelFlashEvent.flashes += 1;
+//    //        }
+//    //    }
+//    //}
+//    //
+//    //PixelFlashEventsSize = distance(PixelFlashEvents.begin(), PixelFlashEvents.end());
+//    //snprintf(buf, sizeof(buf), "After For, PixelFlashEventsSize=%d", PixelFlashEventsSize);
+//    //debug_pln(String(buf));
+//    //
+//    //PixelFlashEvents.remove_if([current_millis](const PixelFlashEvent& PixelFlashEvent) {
+//    //    return (PixelFlashEvent.nextChangeMillis <=current_millis && PixelFlashEvent.flashes <= 0);
+//    //});
+//}
+
+void task50ms(void)
+{
+    /* reference only
+        typedef struct {
+            uint32_t color0;
+            uint32_t color1;
+            uint32_t durationMillis;
+            uint8_t flashes;
+            uint8_t current_color;    // always 0 (color0) or 1 (color1)
+            uint32_t nextChangeMillis;
+        } PixelFlashEvent_t;
+
+    */
+    //static PixelFlashEvent_t last_pe={NeoBlack, NeoBlack, 0, 0, NeoBlack, PIXEL_TRIG_NOW};
+    //static bool didAction=false;
+    uint32_t current_millis = millis();
+
+    //if (memcmp((const void *) &last_pe, (const void *) &pixelAction, sizeof(PixelFlashEvent_t)) != 0) {
+    //    dump_pixelAction("task50ms new pe: ", pixelAction);
+    //    last_pe = pixelAction;
+    //}
+
+    if (pixelAction.nextChangeMillis > 0 && pixelAction.nextChangeMillis <= current_millis  ) {
+        if (pixelAction.current_color == 0) {
+            digitalWrite(NEOPIXEL_POWER, 1);
+            pixel.setPixelColor(0, pixelAction.color0);
+            pixel.show();
+            //debug_p("Sent color0 (");
+            //debug_p(pixelAction.color0);
+            //debug_pln(") to pixel");
+            pixelAction.nextChangeMillis = millis() + (pixelAction.durationMillis / 2);
+            pixelAction.current_color = 1;
+
+        } else if (pixelAction.current_color == 1) {
+            digitalWrite(NEOPIXEL_POWER, 1);
+            pixel.setPixelColor(0, pixelAction.color1);
+            pixel.show();
+            //debug_p("Sent color1 (");
+            //debug_p(pixelAction.color1);
+            //debug_pln(") to pixel");
+            pixelAction.nextChangeMillis = millis() + (pixelAction.durationMillis / 2);
+            pixelAction.current_color = 0 ;
+            // pixelAction.flashes = pixelAction.flashes - 1;
+            pixelAction.flashes -= 1;
+
+        }
+    }
+    if (pixelAction.flashes == 0) {
+        pixelAction.nextChangeMillis = 0;
+        digitalWrite(NEOPIXEL_POWER, 0);
+
+    }
+}
+
+
 
 void loop() {
     uint32_t sysTick = millis();
@@ -727,10 +1098,10 @@ void loop() {
     avgSpeed.reading(analogRead(SPEED_CONTROL_POT_PIN));
     avgRightTouch.reading(touchRead(BUTTON_RIGHT_TOUCH_PIN));
 
-    //if(sysTick - tick16 > 16){
-    //  tick16 = sysTick;
-    //  //task16ms();
-    //}
+    if(sysTick - tick50 > 50){
+      tick50 = sysTick;
+      task50ms();
+    }
     if(sysTick - tick128 > 128){
       tick128 = sysTick;
       task128ms();
@@ -742,36 +1113,36 @@ void loop() {
     }
 
     // ----- Serial Commands Handling  (should go away?) ------
-    while (Serial.available()) {
-        char inChar = (char) Serial.read();
-        if (inChar == '\n') {
-            debug_pln(inputString);
-
-            if (inputString == "startpair") {
-                simpleEspConnection.startPairing(30);
-            } else if (inputString == "endpair") {
-                simpleEspConnection.endPairing();
-            } else if (inputString == "changepairingmac") {
-                uint8_t np[] {0xCE, 0x50, 0xE3, 0x15, 0xB7, 0x33};
-
-                simpleEspConnection.setPairingMac(np);
-            } else if (inputString == "textsend") {
-                if (!simpleEspConnection.sendMessage("This comes from the Client")) {
-                    debug_pln("SENDING TO '" + serverAddress + "' WAS NOT POSSIBLE!");
-                }
-            } else if (inputString == "structsend") {
-                if (!sendStructMessage()) {
-                    debug_pln("SENDING TO '" + serverAddress + "' WAS NOT POSSIBLE!");
-                }
-            } else if (inputString == "bigsend") {
-                if (!sendBigMessage()) {
-                    debug_pln("SENDING TO '" + serverAddress + "' WAS NOT POSSIBLE!");
-                }
-            }
-
-            inputString = "";
-        } else {
-            inputString += inChar;
-        }
-    }
+    //while (Serial.available()) {
+    //    char inChar = (char) Serial.read();
+    //    if (inChar == '\n') {
+    //        debug_pln(inputString);
+    //
+    //        if (inputString == "startpair") {
+    //            simpleEspConnection.startPairing(30);
+    //        } else if (inputString == "endpair") {
+    //            simpleEspConnection.endPairing();
+    //        } else if (inputString == "changepairingmac") {
+    //            uint8_t np[] {0xCE, 0x50, 0xE3, 0x15, 0xB7, 0x33};
+    //
+    //            simpleEspConnection.setPairingMac(np);
+    //        } else if (inputString == "textsend") {
+    //            if (!simpleEspConnection.sendMessage("This comes from the Client")) {
+    //                debug_pln("SENDING TO '" + serverAddress + "' WAS NOT POSSIBLE!");
+    //            }
+    //        } else if (inputString == "structsend") {
+    //            if (!sendStructMessage()) {
+    //                debug_pln("SENDING TO '" + serverAddress + "' WAS NOT POSSIBLE!");
+    //            }
+    //        } else if (inputString == "bigsend") {
+    //            if (!sendBigMessage()) {
+    //                debug_pln("SENDING TO '" + serverAddress + "' WAS NOT POSSIBLE!");
+    //            }
+    //        }
+    //
+    //        inputString = "";
+    //    } else {
+    //        inputString += inChar;
+    //    }
+    //}
 }
