@@ -32,9 +32,13 @@
 #include <forward_list>
 #include <movingAvg.h>                  // https://github.com/JChristensen/movingAvg
 //#define STOP_ALL_SERIAL_IO
+//#include <rtc_io.h>
+//#include <components/driver/include/driver/rtc_io.h>
+#include <driver/rtc_io.h>
 #include "debug_serial_print.h"
 #include "shared_yak_messaging.h"
 
+//#define SKIP_IMU
 
 typedef struct {
     uint32_t color0;
@@ -52,7 +56,8 @@ PixelFlashEvent_t pixelAction;
 //   serverAddress = "AC0BFBDCE1F1"; // Test if you know the server
 //   serverAddress = "AC0BFBDD4100"; // Initial trial w/ WeMos D1Mini Pro
 //   serverAddress = "A0764E5ADF70"; // ESP32-C3-mini-1 (board is ESP32-C3-DevKitM-1)
-#define SERVER_ADDRESS "A0764E5ADF70"
+//   serverAddress = "4091512D0DA0"; // Adafruit Feather ESP32   (NOT ESP32 V2)
+#define SERVER_ADDRESS "4091512D0DA0"
 
 #define EEPROM_SIZE 1
 #define EE_LAST_BOOT_BEHAVIOR_ADDR 0x0
@@ -83,6 +88,8 @@ PixelFlashEvent_t pixelAction;
 String inputString;
 String serverAddress;
 String clientAddress;  // This is me
+    String tmpClientAddr="";
+
 //std::vector<String> gear{ "NEUTRAL", "FORWARD", "REVERSE" };   Replaced by GEAR_t_v
 char tft_lin_buf[50];
 uint16_t motorSpeedPotVal=0;
@@ -91,8 +98,8 @@ uint8_t motorSpeedPercent=0;
 static uint32_t tick50=0, tick128=0, tick10000=0, tick30000=0;
 uint16_t maxPotAdcVal=5000;  // used in scaling, adjusts higher if new value is higher
 uint32_t lastActionMillis=0;
-int avgRightTouchVal=1, lastAvgRightTouchVal=1, longTermAvgRightTouch=0;
-bool touchUpdateHoldoff=false;
+int avgRightTouchVal=1, lastAvgRightTouchVal=1, longTermAvgRightTouch=0;  // touchRead() returns an int
+bool statusUpdateHoldoff=false;
 bool batteryUpdateHoldoff=false;
 bool LC709203FisOK = false;
 uint32_t nextMotionUnblockMillis=0;
@@ -107,39 +114,61 @@ uint32_t nextWiFiOffMS=0;
 bool isBeingTouched=false;
 bool lastIsBeingTouched=false;
 uint32_t nextActiveTouchStateCheckMillis=0;
-bool trigUpdateTouchDisplay=false;
-
+bool trigUpdateStatusLineDisplay=false;
+bool crashCheckDone=false;
 
 #define DEFAULT_I2C_PORT &Wire
 
 #define BUTTON_LEFT_PIN 6
+#define BUTTON_LEFT_PIN 6
 #define BUTTON_RIGHT_PIN 5
-#define BUTTON_RIGHT_TOUCH_PIN 14
+//#define BUTTON_RIGHT_TOUCH_PIN 14
+#define BUTTON_RIGHT_TOUCH_PIN 12
 #define SWITCH_FORWARD_PIN 10
 #define SWITCH_REVERSE_PIN 9
 #define SPEED_CONTROL_POT_PIN 8
 #define ACCEL_INT_1_PIN 15
+#define BOARD_LED   13
 
 #define I2C_ADDR_ACCEL_BMI160 0x69
 
-#define DISP_GEAR_LINE_PIXEL 42
-#define DISP_GEAR_SIZE 3
-#define DISP_BOTTOM_WARN_PIXEL 114
-#define DISP_BOTTOM_WARN_SIZE 3
-#define DISP_ADDR_LINE_PIXEL 15
+#define DISP_ADDR_LINE_PIXEL 21 // 15
 #define DISP_ADDR_LINE_SIZE 2
 
-#define DISP_DEBUG_LINE_PIXEL 68
-#define DISP_DEBUG_LINE_SIZE 2
+#define DISP_GEAR_LINE_PIXEL 42
+#define DISP_GEAR_SIZE 3
+
+#define DISP_STATUS_LINE_PIXEL 68
+#define DISP_STATUS_LINE_SIZE 2
+
+#define DISP_TOP_STATUS_LINE_PIXEL 0
+#define DISP_TOP_STATUS_LINE_SIZE 2
+
+#define DISP_BOTTOM_WARN_PIXEL 114
+#define DISP_BOTTOM_WARN_SIZE 3
+
 #define DISP_BATT_LINE_PIXEL 120
 #define DISP_BATT_LINE_SIZE 2
 
 #define INACTIVITY_MS_BEFORE_REDUCE_PWR 60000
 #define INACTIVITY_MS_BEFORE_SLEEP 1200000
-#define AFTER_MOTION_IGNORE_MS 30000
+#define AFTER_MOTION_IGNORE_MS 6000
 #define MOTION_DISPLAY_MS 5000
-#define WIFI_INACTIVITY_SLEEP 5000
+#define WIFI_INACTIVITY_SLEEP 500
+#define uS_TO_S_FACTOR 1000000LL  /* Conversion factor for micro seconds to seconds */
 
+#define LC709203F_APA_500MAH = 0x10,
+#define LC709203F_APA_850MAH_interpolted 0x13
+#define LC709203F_APA_1000MAH = 0x19,
+#define LC709203F_APA_1000MAH = 0x19,
+#define LC709203F_APA_1500MAH_interpolted 0x20
+#define LC709203F_APA_2000MAH = 0x2D,
+#define LC709203F_APA LC709203F_APA_1500MAH_interpolted
+
+        // Our battery is 850 mA.. So trying 0x13  (slightly less than intuitive)
+
+
+uint8_t currentStatusLinePixel=DISP_STATUS_LINE_PIXEL;
 
 // Use dedicated hardware SPI pins
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
@@ -172,10 +201,13 @@ yakMessage_t yakMessage = { YAK,        // msgType
 #define NeoWhite    0xFFFFFF
 #define NeoRed      0xFF0000
 #define NeoGreen    0x00FF00
+#define NeoDimGreen 0x000F00
+#define NeoMinGreen 0x000100
 #define NeoBlue     0x0000FF
 #define NeoYellow   0xFFFF00
 #define NeoMagenta  0xFF00FF
 #define NeoPurple   0x800080
+#define NeoDarkPurple 0x2c0222
 #define NeoOrange   0xFF8C00
 #define NeoLime     0x00FF00
 #define NeoNavyBlue 0x000080
@@ -219,35 +251,36 @@ void flash_pixel(uint32_t color0, uint8_t flashes=1, uint32_t duration=500, uint
 #define ST77XX_DarkRed 0x78c3
 
 
-void lineLocator(int8_t fontSize, int8_t pixelLine, int8_t chars=0)
+void lineLocator(int8_t fontSize, int8_t pixelLine, int8_t insetChars=0)
 {
+    debug_pln("Locate line at size " + String(fontSize) + "pix Y:" + String(pixelLine) + " offset:" + String(insetChars));
     tft.setTextColor(ST77XX_WHITE);
     tft.setTextSize(fontSize);
     tft.setCursor(0 /*x*/, pixelLine);
-    while (chars--) {
+    while (insetChars--) {
         tft.print(" ");
     }
     tft.print(char(0xDA)); // 0xDA is the CP437(false) square block
 }
 
 
-void clearTextLine(int8_t chars, bool debug=false)
+//void clearTextLine(int8_t chars, bool debug=false)
+//{
+//
+//    tft.setTextColor(ST77XX_BLACK);
+//    while (--chars) {
+//        tft.print(char(0xDA)); // 0xDA is the CP437(false) square block
+//    }
+//    if (debug) {
+//        tft.setTextColor(ST77XX_RED);
+//        tft.println(".");
+//    }
+//}
+
+
+void clearSizedTextLine(int8_t fontSize, int8_t pixelLine, bool plus=false, bool debug=false)
 {
-
-    tft.setTextColor(ST77XX_BLACK);
-    while (--chars) {
-        tft.print(char(0xDA)); // 0xDA is the CP437(false) square block
-    }
-    if (debug) {
-        tft.setTextColor(ST77XX_RED);
-        tft.println(".");
-    }
-}
-
-
-void clearSizedTextLine(int8_t fontSize, int8_t pixelLine, bool debug=false)
-{
-    int chars=0;
+    int8_t chars, charsCntr;
 
     // size 1:   i=41 for char(0xDA)
     // size 2:   i=21 for char(0xDA)
@@ -266,15 +299,30 @@ void clearSizedTextLine(int8_t fontSize, int8_t pixelLine, bool debug=false)
             return;
     }
 
+    charsCntr = chars;
     tft.setTextSize(fontSize);
+    if (plus) {
+        debug_pln("plus");
+        charsCntr -= 1;
+        tft.setCursor(2 /*x*/, pixelLine);
+        tft.setTextColor(ST77XX_BLACK);
+        while (--charsCntr) {
+            tft.print(char(0xDA)); // 0xDA is the CP437(false) square block
+        }
+    }
+    charsCntr = chars;
     tft.setCursor(0 /*x*/, pixelLine);
     tft.setTextColor(ST77XX_BLACK);
-    while (--chars) {
+    while (--charsCntr) {
         tft.print(char(0xDA)); // 0xDA is the CP437(false) square block
     }
+
     if (debug) {
+        debug_pln("debug ASSERTED");
+
         tft.setTextColor(ST77XX_RED);
-        tft.print(".");
+        //tft.print(".");
+        tft.print(char(0xDA));
     }
     tft.setCursor(0 /*x*/, pixelLine);
 }
@@ -311,7 +359,7 @@ void updateGearStateDisplay(void)
 //    uint16_t color = ST77XX_ORANGE;
 //    uint32_t aRTV=0;
 //
-//    clearSizedTextLine(DISP_DEBUG_LINE_SIZE, DISP_DEBUG_LINE_PIXEL);
+//    clearSizedTextLine(DISP_STATUS_LINE_SIZE, DISP_STATUS_LINE_PIXEL);
 //    if (!touchUpdateHoldoff) {
 //        tft.setTextColor(color);
 //        tft.print("Touch:");
@@ -327,7 +375,7 @@ void updateGearStateDisplay(void)
 //    }
 //}
 
-void updateTouchDisplay(void)
+void updateStatusLineDisplay(void)
 {
     uint16_t color = ST77XX_ORANGE;
     uint32_t aRTV=0;
@@ -343,14 +391,14 @@ void updateTouchDisplay(void)
     // "T___ MOT WiFi <rssi>"
     // "%c%3d %3s %4s "
     // printf("%-40s", "Test");   Right Justify te string
-    if (!touchUpdateHoldoff) {
-        clearSizedTextLine(DISP_DEBUG_LINE_SIZE, DISP_DEBUG_LINE_PIXEL);
+    if (!statusUpdateHoldoff) {
+        clearSizedTextLine(DISP_STATUS_LINE_SIZE, currentStatusLinePixel);
         if (isBeingTouched) {
             tft.setTextColor(ST77XX_ORANGE);
         } else {
             tft.setTextColor(ST77XX_DkGray);
         }
-        tft.print("  T");    // ToDo:  Remove "  " after I implement a non-toast TFT display
+        tft.print("T");
 
         aRTV = avgRightTouchVal > 1000 ? avgRightTouchVal = avgRightTouchVal/100 : avgRightTouchVal;
         //snprintf(buf, sizeof(buf), "%3.0f", (1.0 *
@@ -374,8 +422,17 @@ void updateTouchDisplay(void)
             tft.print(block); // 0xDA is the CP437(false) square block
         }
     } else {
-        debug_pln("touchUpdateHoldoff!  Skipping display update");
+        debug_pln("statusUpdateHoldoff!  Skipping display update");
     }
+}
+
+void relocate_updateStatusLineDisplay(void)
+{
+    clearSizedTextLine(DISP_STATUS_LINE_SIZE, currentStatusLinePixel);
+    currentStatusLinePixel = DISP_TOP_STATUS_LINE_PIXEL;
+    // clearSizedTextLine(int8_t fontSize, int8_t pixelLine, bool plus=false, bool debug=false)
+    clearSizedTextLine(DISP_STATUS_LINE_SIZE, currentStatusLinePixel, true);
+    updateStatusLineDisplay();
 }
 
 
@@ -396,6 +453,12 @@ void updateBatteryDisplay(void)
     }
 }
 
+void updateMyIPaddressLine(void)
+{
+    clearSizedTextLine(DISP_ADDR_LINE_SIZE, DISP_ADDR_LINE_PIXEL);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.println( "I'm " + clientAddress);
+}
 
 // ---------------------- Button Callbacks & Handlers  ------------------------
 void onLeftPressShortRelease(void)
@@ -403,13 +466,15 @@ void onLeftPressShortRelease(void)
     lastActionMillis = millis();
 
     debug_pln("Short Left Press (TFT Backlight ON)");
-    digitalWrite(NEOPIXEL_POWER, 1);
-    delay(20);
-    pixel.clear();
-    pixel.setPixelColor(0, pixel.Color(10, 0, 10));
-    pixel.show();
+    //digitalWrite(NEOPIXEL_POWER, 1);
+    //delay(20);
+    //pixel.clear();
+    //pixel.setPixelColor(0, pixel.Color(10, 0, 10));
+    //pixel.show();
 
     digitalWrite(TFT_BACKLITE, HIGH);
+
+    batteryUpdateHoldoff = false;
 
     updateGearStateDisplay();
     updateBatteryDisplay();
@@ -425,30 +490,32 @@ void onLeftPressShortRelease(void)
 }
 
 
-void onLeftPressLongStart(void)
+void onLeftPressLongRelease(void)
 {
     lastActionMillis = millis();
 
     debug_pln("Long Left Press (TFT Backlight + Pixel OFF)");
 
-    touchUpdateHoldoff = true;
-    batteryUpdateHoldoff = true;
-
-    digitalWrite(NEOPIXEL_POWER, 0);
-
-    clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
-    for (int i=2; i; i--){
-        tft.setTextColor(ST77XX_RED);
-        tft.print("BL OFF in " + String(i));
-        //clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
-        delay(1000);
+    if (!buttonRight.isPressed()) {
+        batteryUpdateHoldoff = true;
+        clearSizedTextLine(DISP_BATT_LINE_SIZE, DISP_BATT_LINE_PIXEL);
         clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
+        for (int i=2; i; i--){
+            tft.setTextColor(ST77XX_RED);
+            tft.print("BL OFF in " + String(i));
+            //clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
+            delay(1000);
+            //clearSizedTextLine(DISP_BATT_LINE_SIZE, DISP_BATT_LINE_PIXEL);
+            clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
+        }
+
+        digitalWrite(TFT_BACKLITE, LOW);
     }
 
-    digitalWrite(TFT_BACKLITE, LOW);
+    //batteryUpdateHoldoff = true;
+    //statusUpdateHoldoff = true;
 
-    batteryUpdateHoldoff = false;
-    
+
     //pixel.clear();
     //pixel.setPixelColor(0, pixel.Color(150, 0, 0));
     //pixel.show();
@@ -458,12 +525,18 @@ void onLeftPressLongStart(void)
 
 void onRightPressShortRelease(void)
 {
-    debug_pln("Short Right Press (WiFi On)");
+    debug_pln("Short Right Press (Locate)");
 
-    connectionWake();
+    lineLocator(DISP_ADDR_LINE_SIZE, DISP_ADDR_LINE_PIXEL, 3);
 
-    touchUpdateHoldoff = false;
+    //delay(3000);
+    updateMyIPaddressLine();
 
+    //delay(3000);
+    relocate_updateStatusLineDisplay();
+    //updateBatteryDisplay();
+    //
+    //statusUpdateHoldoff = false;
 }
 
 
@@ -472,12 +545,13 @@ void onRightPressLongRelease(void)
     lastActionMillis = millis();
     pixel.clear();
     pixel.show();
-    digitalWrite(NEOPIXEL_POWER, 0);
 
     debug_pln("Long Right Press (reboot or WiFi OFF)");
     batteryUpdateHoldoff = true;
 
     if (buttonLeft.isPressed()) {
+        batteryUpdateHoldoff = true;
+        clearSizedTextLine(DISP_BATT_LINE_SIZE, DISP_BATT_LINE_PIXEL);
         debug_pln("Long Right Press w/ Left (Initiating Reboot Sequence)");
         for (int i=4; i; i--){
             clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
@@ -487,13 +561,22 @@ void onRightPressLongRelease(void)
         }
         ESP.restart();
     } else {
-        debug_pln("Long Right Press alone... WiFI OFF");
-        flash_pixel(NeoGreen, 1, 300, NeoNavyBlue);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=250,uint32_t color1=NeoBlack)
-        flash_pixel(NeoBrown, 1, 1000);
-        connectionSleep();
+        //debug_pln("Long Right Press alone... Inducing Light Sleep");
+        //flash_pixel(NeoGreen, 1, 1000, NeoNavyBlue);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=250,uint32_t color1=NeoBlack)
+        //flash_pixel(NeoOrange, 1, 500);
+        //flash_pixel(NeoRed, 1, 100);
+        //
+        //batteryUpdateHoldoff = true;
+        //clearSizedTextLine(DISP_BOTTOM_WARN_SIZE, DISP_BOTTOM_WARN_PIXEL);
+        ////tft.setTextColor(ST77XX_RED);
+        ////tft.print("WiFi ...OFF");
+        ////delay(1000);
+        ////nextWiFiOffMS = millis() + WIFI_INACTIVITY_SLEEP;
+        //connectionLightSleep();
     }
 
     batteryUpdateHoldoff = false;
+    updateBatteryDisplay();
 }
 
 
@@ -555,7 +638,7 @@ float convertRawGyro(int gRaw) {
     return g;
 }
 
-
+#if !defined(SKIP_IMU)
 void check_IMU(void)
 {
     int gxRaw, gyRaw, gzRaw;         // raw gyro values
@@ -579,19 +662,18 @@ void check_IMU(void)
     debug_pln();
 
 }
+#endif
 
-
-bool sendYakMessage()
+void sendYakMessage()
 {
     yakMessage_t sendableMessage = yakMessage;
-    bool resp;
-    
+
     if (!wifiIsUp) {
+        debug_pln("sendYakMessage: connectionWake");
         connectionWake();
     }
-    resp = simpleEspConnection.sendMessage((uint8_t * ) & sendableMessage, sizeof(sendableMessage));
-    //return (simpleEspConnection.sendMessage((uint8_t * ) & sendableMessage, sizeof(sendableMessage)));
-    return resp;
+    // resp is bool: true=OK, false=FAIL
+    simpleEspConnection.sendMessage((uint8_t * ) & sendableMessage, sizeof(sendableMessage));
 }
 
 void dump_pixelAction(char *prefix, PixelFlashEvent_t pe)
@@ -628,10 +710,14 @@ void flash_pixel(uint32_t color0, uint8_t flashes, uint32_t duration, uint32_t c
 
 void OnSendError(uint8_t * ad)
 {
-  debug_pln("SENDING TO '" + simpleEspConnection.macToStr(ad) + "' WAS NOT POSSIBLE!");
-  flash_pixel(NeoRed, 3, 300);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=500,uint32_t color1=NeoBlack)
+    debug_pln("Send to " + simpleEspConnection.macToStr(ad) + " FAILED");
+    flash_pixel(NeoRed, 1, 100);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=500,uint32_t color1=NeoBlack)
 }
 
+void OnSendDone(uint8_t * ad)
+{
+    flash_pixel(NeoMinGreen, 1, 10);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=500,uint32_t color1=NeoBlack)
+}
 
 void OnMessage(uint8_t * ad, const uint8_t * message, size_t len)
 {
@@ -647,7 +733,7 @@ void OnMessage(uint8_t * ad, const uint8_t * message, size_t len)
         //yakCommsMessage_t *yakCommsMessage = (yakCommsMessage_t *) message;
         switch(yakCommsMessage->commState) {
             case CONNECTED:
-                flash_pixel(NeoNavyBlue, 1, 200);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=500,uint32_t color1=NeoBlack)
+                flash_pixel(NeoNavyBlue, 2, 200);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=500,uint32_t color1=NeoBlack)
                 break;
 
         default:
@@ -701,13 +787,16 @@ void connectionStart(void)
 
     if (! simpleConncectIsOK) {
         debug_pln("ERROR - simpleEspConnection begin FAILED");
-        flash_pixel(NeoOrange, 3, 200);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=500,uint32_t color1=NeoBlack)
+        flash_pixel(NeoOrange, 1, 100);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=500,uint32_t color1=NeoBlack)
+    } else {
+        flash_pixel(NeoDimGreen, 1, 50);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=500,uint32_t color1=NeoBlack)
     }
     //  simpleEspConnection.setPairingBlinkPort(2);
     serverAddress = SERVER_ADDRESS ; // Address discovered by manual pairing
     simpleEspConnection.setServerMac(serverAddress);
     simpleEspConnection.onNewGatewayAddress( & OnNewGatewayAddress);
     simpleEspConnection.onSendError( & OnSendError);
+    simpleEspConnection.onSendDone( & OnSendDone);
     simpleEspConnection.onMessage( & OnMessage);
     simpleEspConnection.onConnected( & OnConnected);
 
@@ -738,58 +827,120 @@ void connectionSleep()
     wifiIsUp = false;
     WiFi.disconnect();
     WiFi.mode(WIFI_OFF);
-    //updateTouchDisplay();
-    trigUpdateTouchDisplay = true;
+    //updateStatusLineDisplay();
+    trigUpdateStatusLineDisplay = true;
+}
+
+void print_wakeup_reason()
+{
+    uint8_t wakeUpReasons=0;
+    esp_sleep_wakeup_cause_t wakeup_reason;
+
+    wakeup_reason = esp_sleep_get_wakeup_cause();
+
+    if (wakeup_reason & ESP_SLEEP_WAKEUP_EXT0) {
+        debug_pln("Wakeup caused by external signal using RTC_IO");
+        wakeUpReasons +=1;
+    }
+    if (wakeup_reason & ESP_SLEEP_WAKEUP_EXT1) {
+        debug_pln("Wakeup caused by external signal using RTC_CNTL");
+        wakeUpReasons +=1;
+    }
+    if (wakeup_reason & ESP_SLEEP_WAKEUP_TIMER) {
+        debug_pln("Wakeup caused by timer");
+        wakeUpReasons +=1;
+    }
+    if (wakeup_reason & ESP_SLEEP_WAKEUP_TOUCHPAD) {
+        debug_pln("Wakeup caused by touchpad");
+        wakeUpReasons +=1;
+    }
+    if (wakeup_reason & ESP_SLEEP_WAKEUP_ULP) {
+        debug_pln("Wakeup caused by ULP program");
+        wakeUpReasons +=1;
+    }
+
+    if (wakeUpReasons == 0) {
+        debug_p("Wakeup was not caused by deep sleep:");
+        debug_pln(wakeup_reason, HEX);
+    }
+}
+
+
+
+void connectionLightSleep()
+{
+    wifiIsUp = false;
+    WiFi.disconnect();
+    WiFi.mode(WIFI_OFF);
+    //updateStatusLineDisplay();
+    debug_pln("connectionLightSleep: WiFi now OFF");
+    debug_p("connectionLightSleep: Button state of BUTTON_RIGHT_PIN is ");
+    debug_pln(digitalRead(BUTTON_RIGHT_PIN));
+
+    debug_pln("Now inducing Light Sleep in 2 sec");
+    delay(2000);
+    debug_p("connectionLightSleep: LAST CHECK of BUTTON_RIGHT_PIN is ");
+    debug_pln(digitalRead(BUTTON_RIGHT_PIN));
+    delay(100);
+    BMI160.detachInterrupt();
+    delay(100);
+
+
+    //rtc_gpio_pullup_en((gpio_num_t) BUTTON_RIGHT_PIN);
+    //gpio_wakeup_enable((gpio_num_t) BUTTON_RIGHT_PIN, GPIO_INTR_LOW_LEVEL);
+    //esp_sleep_enable_ext0_wakeup((gpio_num_t) BUTTON_RIGHT_PIN, GPIO_INTR_LOW_LEVEL);
+    //esp_sleep_enable_gpio_wakeup();
+
+    uint32_t SleepTimeSeconds=5;
+    esp_sleep_enable_timer_wakeup(uint64_t(SleepTimeSeconds) * uS_TO_S_FACTOR);
+    delay(100);
+
+    //gpio_pullup_en((gpio_num_t) BUTTON_RIGHT_PIN);
+    // //rtc_gpio_set_direction_in_sleep((gpio_num_t) BUTTON_RIGHT_PIN, INPUT_PULLUP);
+    //gpio_set_direction_in_sleep((gpio_num_t) BUTTON_RIGHT_PIN, INPUT_PULLUP);
+    //esp_sleep_enable_ext0_wakeup((gpio_num_t) BUTTON_RIGHT_PIN, 0); //1 = High, 0 = Low
+    // //esp_sleep_enable_timer_wakeup(1000000); //1 seconds
+    //esp_sleep_enable_timer_wakeup(100000000); //100 seconds
+
+    esp_light_sleep_start();
+
+    delay(200);
+    debug_pln("connectionLightSleep: Back from Light Sleep");
+    delay(200);
+    print_wakeup_reason();
+
+    delay(200);
+    // //detachInterrupt((gpio_num_t) BUTTON_RIGHT_PIN);
+    rtc_gpio_deinit((gpio_num_t) BUTTON_RIGHT_PIN);
+
+    //buttonRight.begin();
+    //buttonRight.onPressed(onRightPressShortRelease);
+    //buttonRight.onPressedFor(3000, onRightPressLongRelease);
+
+    debug_pln("HERE.. Maybe put WiFi ON, connection?");
+
+    trigUpdateStatusLineDisplay = true;
 }
 
 
 void connectionWake()
 {
+    debug_pln("connectionWake()");
+
     connectionStart();
 
-    delay(51);       // ToDo: Check if this is needed.. affects responsiveness
+    //delay(51);       // ToDo: Check if this is needed.. affects responsiveness
     wifiIsUp = true;
-    trigUpdateTouchDisplay = true;
+    trigUpdateStatusLineDisplay = true;
 }
-
-/*
-
-Wifi shutdown, restart ideas:
-
-esp_now_deinit();
-WiFi.disconnect();
-WiFi.mode(WIFI_OFF);
-WiFi.forceSleepBegin();
-
-
-void enableWiFi(){
-    adc_power_on();
-    WiFi.disconnect(false);  // Reconnect the network
-    WiFi.mode(WIFI_STA);    // Switch WiFi off
-
-    Serial2.println("START WIFI");
-    WiFi.begin(STA_SSID, STA_PASS);
-
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial2.print(".");
-    }
-
-    Serial2.println("");
-    Serial2.println("WiFi connected");
-    Serial2.println("IP address: ");
-    Serial2.println(WiFi.localIP());
-}
-
-*/
-
-
-
-
-
 
 
 void setup() {
+    pinMode(BOARD_LED, OUTPUT);
+    digitalWrite(BOARD_LED, HIGH);
+    delay(100);
+    digitalWrite(BOARD_LED, LOW);
+
     EEPROM.begin(EEPROM_SIZE);
 
     uint8_t ee_last_boot_behavior = EEPROM.read(EE_LAST_BOOT_BEHAVIOR_ADDR);
@@ -804,11 +955,15 @@ void setup() {
 # if !defined(STOP_ALL_SERIAL_IO)
     delay(1500);  // 400 required for ESP8266 "D1 Mini Pro"
 #endif
-    debug_p("\nClient Setup...Client address: ");
 
     if (ee_last_boot_behavior == EE_LAST_BOOT_BEHAVIOR_CRASH) {
-        debug_pln("\nLast boot CRASHED.. DELAYING 30 Sec NOW to allow a better Sketch upload");
-        delay(30000);
+        debug_pln("\nLast boot CRASHED.. DELAYING 20 Sec NOW to allow a better Sketch upload");
+        for (int x=0; x<133; x++) {    // 30000/150
+            digitalWrite(BOARD_LED, HIGH);
+            delay(150);
+            digitalWrite(BOARD_LED, LOW);
+            delay(150);
+        }
     } else {
         EEPROM.write(EE_LAST_BOOT_BEHAVIOR_ADDR, EE_LAST_BOOT_BEHAVIOR_CRASH);
         EEPROM.commit();
@@ -851,9 +1006,14 @@ void setup() {
         debug_p("Thermistor B = "); debug_pln(lc.getThermistorB());
 
         //   LC709203F_APA_500MAH = 0x10,
+        //   LC709203F_APA_850MAH_interpolted 0x13
         //   LC709203F_APA_1000MAH = 0x19,
-        // Our battery is 850 mA.. So trying 0x13  (slightly less than intuitive)
-        lc.setPackSize((lc709203_adjustment_t)0x13);
+        //   LC709203F_APA_2000MAH = 0x2D,
+        // Our battery was 850 mAH, NOW 1500 mAH.. so a little interpolation
+        lc.setPackSize((lc709203_adjustment_t)LC709203F_APA);
+        debug_p(F("LC709203F, Using 0x"));
+        debug_p(LC709203F_APA, HEX);
+        debug_pln(F(" for APA (interpolated for  1500mAH battery)"));
 
         lc.setAlarmVoltage(3.8);  // Not really needed (or used), since the alarm pin out is NC
 
@@ -865,6 +1025,7 @@ void setup() {
     }
 
     // ---------------------- BMI160 IMU (Accelerometer/Gyro) Initialization ------------------------
+#if !defined(SKIP_IMU)
     debug_pln("Initializing IMU device...");
     //BMI160.begin(BMI160GenClass::SPI_MODE, /* SS pin# = */10);
     BMI160.begin(BMI160GenClass::I2C_MODE, I2C_ADDR_ACCEL_BMI160, ACCEL_INT_1_PIN);
@@ -872,7 +1033,8 @@ void setup() {
     debug_p("IMU DEVICE ID: ");
     debug_pln(dev_id, HEX);
 
-    BMI160.attachInterrupt(bmi160_intr);
+//   AW_DEBUG out for Sleep Debug!   BMI160.attachInterrupt(bmi160_intr);
+
     //BMI160.setIntTapEnabled(true);
 
      // Set the accelerometer range to 250 degrees/second
@@ -901,15 +1063,15 @@ void setup() {
     // debug_p("]");
     debug_pln();
     debug_pln("Initializing IMU device...done.");
+#else
+    debug_pln("SKIPING IMU device");
+#endif
 
     // ---------------------- simpleEspConnection (comms initialization) ------------------------
     uint32_t wiFiUpMillis=0;
     uint32_t wiFiStartMillis = millis();
     connectionStart();
     wiFiUpMillis=millis();
-    debug_pln("Wifi startup time: " + String(wiFiUpMillis - wiFiStartMillis) + " ms");
-
-    //debug_pln("I'm the client! My MAC address is " + WiFi.macAddress());
     clientAddress = WiFi.macAddress();
 
     // Remove ':' from address string
@@ -922,11 +1084,28 @@ void setup() {
         }
         tmpClientAddr += clientAddress.charAt(x++);
     }
-    debug_pln("My MAC address is " + tmpClientAddr);
 
-    tft.setTextColor(ST77XX_YELLOW);
-    tft.setTextSize(2);
-    tft.println("I'm " + tmpClientAddr);
+    clientAddress = tmpClientAddr;
+
+
+    debug_pln("Wifi "+String(clientAddress)+", startup time: " + String(wiFiUpMillis - wiFiStartMillis) + " ms " + String(clientAddress));
+
+    //debug_pln("I'm the client! My MAC address is " + WiFi.macAddress());
+
+    nextWiFiOffMS = millis() + WIFI_INACTIVITY_SLEEP;
+
+    //// Remove ':' from address string
+    //String tmpClientAddr="";
+    //int x=0, wmaLen=clientAddress.length();
+    //while(x < wmaLen){
+    //    if (clientAddress.charAt(x) == ':') {
+    //        x += 1;
+    //        continue;
+    //    }
+    //    tmpClientAddr += clientAddress.charAt(x++);
+    //}
+    //debug_pln("My MAC address is " + tmpClientAddr);
+
     // --- end of simpleEspConnection ----
 
     buttonRight.begin();
@@ -935,7 +1114,7 @@ void setup() {
     switchReverse.begin();
 
     buttonLeft.onPressed(onLeftPressShortRelease);
-    buttonLeft.onPressedFor(2000, onLeftPressLongStart);
+    buttonLeft.onPressedFor(2000, onLeftPressLongRelease);
     buttonRight.onPressed(onRightPressShortRelease);
     buttonRight.onPressedFor(3000, onRightPressLongRelease);
     switchForward.onPressedFor(200, onSwitchForward);
@@ -946,23 +1125,31 @@ void setup() {
     avgRightTouch.begin();
     avgRightTouchLong.begin();
 
-    updateGearStateDisplay();
-
     // THIS will suck power.. Find a way to turn off!
     pinMode(NEOPIXEL_POWER, OUTPUT);
-    digitalWrite(NEOPIXEL_POWER, 1);
+    //digitalWrite(NEOPIXEL_POWER, 1);
     pixel.begin();
-    pixel.clear();
-    pixel.setPixelColor(0, pixel.Color(0, 0, 150));
-    pixel.show();
+    //pixel.clear();
+    //pixel.setPixelColor(0, pixel.Color(0, 0, 150));
+    //pixel.show();
+
+    updateGearStateDisplay();
+    updateMyIPaddressLine();
+
+    delay(2000);
+
 }
 
 void restoreAllNormalDisplay(void)
 {
+    debug_pln("restoreAllNormalDisplay()");
+    batteryUpdateHoldoff = false;
+    statusUpdateHoldoff = false;
+    trigUpdateStatusLineDisplay = true;
+
     digitalWrite(TFT_BACKLITE, HIGH);
     updateGearStateDisplay();
-    //updateTouchDisplay();
-    trigUpdateTouchDisplay = true;
+    updateStatusLineDisplay();
     updateBatteryDisplay();
 }
 
@@ -978,31 +1165,46 @@ void task30s(void) {
     }
 }
 
-void task10s(void) {
+
+void task10s(void)
+{
     int x;
+    updateBatteryDisplay();
+
+    if (!crashCheckDone) {
+        crashCheckDone=true;
+        uint8_t ee_last_boot_behavior = EEPROM.read(EE_LAST_BOOT_BEHAVIOR_ADDR);
+        if (ee_last_boot_behavior == EE_LAST_BOOT_BEHAVIOR_CRASH) {
+            EEPROM.write(EE_LAST_BOOT_BEHAVIOR_ADDR, EE_LAST_BOOT_BEHAVIOR_OK);
+            EEPROM.commit();
+            debug_pln("Updated EEPROM to EE_LAST_BOOT_BEHAVIOR_OK");
+        }
+    }
+
+    //debug_p("task10s.. Begin: avgRightTouchLong.getCount():");
+    //debug_p(avgRightTouchLong.getCount());
+    //debug_p(", avgRightTouch.getCount():");
+    //debug_pln(avgRightTouch.getCount());
+
     // Do touch averaging
     if (longTermAvgRightTouch == 0) {
-        debug_p("task10s: avgRightTouchLong FIRST update to ");
         x = avgRightTouch.getAvg();
-        debug_p(x);
         avgRightTouchLong.reading(x);
-        debug_pln(",  readback 1 longTermAvgRightTouch:");
         longTermAvgRightTouch = avgRightTouchLong.getAvg();
-        debug_pln(longTermAvgRightTouch);
-
-        //debug_pln(avgRightTouchLong.getAvg())
-    }else if (!isBeingTouched) {
-        debug_p("task10s: avgRightTouchLong untouch update to ");
+    //}else if (!isBeingTouched) {
+    //    x = avgRightTouch.getAvg();
+    //    avgRightTouchLong.reading(x);
+    //    longTermAvgRightTouch = avgRightTouchLong.getAvg();
+    //}
+    }else {
         x = avgRightTouch.getAvg();
-        debug_p(x);
         avgRightTouchLong.reading(x);
-        debug_p(",  readback 2 longTermAvgRightTouch:");
         longTermAvgRightTouch = avgRightTouchLong.getAvg();
-        debug_pln(longTermAvgRightTouch);
-        //debug_pln(avgRightTouchLong.getAvg());
-    } else {
-        debug_pln("task10s: no update");
     }
+    //debug_p("task10s.. END: avgRightTouchLong.getCount():");
+    //debug_p(avgRightTouchLong.getCount());
+    //debug_p(", avgRightTouch.getCount():");
+    //debug_pln(avgRightTouch.getCount());
 }
 
 
@@ -1014,6 +1216,8 @@ void task250ms(void)
 
 void task128ms(void)
 {
+    static bool stillGatheringMsgShown=false;
+
     if (yakMessageUpdated) {
         yakMessage.msgID = ++msgIDcounter;
         nextWiFiOffMS = millis() + WIFI_INACTIVITY_SLEEP;
@@ -1027,7 +1231,7 @@ void task128ms(void)
     float percentChange = (diffVal/lastMotorSpeedPotVal) * 100.0;
     //debug_p("motorSpeedPotVal="+String(motorSpeedPotVal)+ "   lastMotorSpeedPotVal="+ String(lastMotorSpeedPotVal));
     //debug_p("  diffVal="+ String(diffVal) + ", change(%):" + String(percentChange));
-    if ( abs(percentChange) > 2.0 ) {
+    if ( abs(percentChange) > 3.0 ) {
         //Serial.println(" Update");
         lastActionMillis = millis();
         lastMotorSpeedPotVal = motorSpeedPotVal;
@@ -1039,6 +1243,7 @@ void task128ms(void)
 
         yakMessage.speed = motorSpeedPercent;
         yakMessage.action = MOTOR_CONTROL;
+        debug_pln("Speed Control yakMessage");
         yakMessageUpdated = true;
 
     } else {
@@ -1054,114 +1259,102 @@ void task128ms(void)
         lastMotorSwitch = motorSwitch;
     }
 
-    if  (trigUpdateTouchDisplay) {
-        updateTouchDisplay();
-        trigUpdateTouchDisplay = false;
+    if  (trigUpdateStatusLineDisplay) {
+        updateStatusLineDisplay();
+        trigUpdateStatusLineDisplay = false;
     }
 
     // ------------- TOUCH CONTROL  (RIGHT BUTTON Body)  ---------------
     // Touch Debug/Adjust: Serial.println("Touch Raw: " + String(touchRead(BUTTON_RIGHT_TOUCH_PIN)));
-    avgRightTouchVal = avgRightTouch.getAvg();
 
-    if (longTermAvgRightTouch) {
-        debug_p("NOW getting avgRightTouchLong.getAvg() from non-zero: ");
-        debug_pln(longTermAvgRightTouch);
-        longTermAvgRightTouch = avgRightTouchLong.getAvg();
-        debug_pln("survived");
-    } else {
-        debug_pln("SKIPPING getting avgRightTouchLong.getAvg() (ZERO)");
-    }
-    int avgRightTouchVal5 = avgRightTouch.getAvg(5);
-    // Touch Debug/Adjust: Serial.println("TOUCH AVG: " + String(avgRightTouchVal) );
+    // must check that it has at least 1 value, else it will CRASH!
+    int numLTsamples = avgRightTouchLong.getCount();
 
-    long percentIncr = (lastAvgRightTouchVal *  110)/100;  // integer math: val + 10%
-    long percentDecr = (lastAvgRightTouchVal *  90)/100;   // integer math: val - 10%
-    debug_pln("NOW dividing getting avgRightTouchLong.getAvg()");
-    long percentFive = (longTermAvgRightTouch *  5)/100;   // integer math: Get 5%
-    // Touch Debug/Adjust: Serial.println("percentIncr="+String(percentIncr)+" of "+String(lastAvgRightTouchVal));
-    // Touch Debug/Adjust: Serial.println("percentDecr="+String(percentDecr)+" of "+String(lastAvgRightTouchVal));
-    // Touch Debug/Adjust: Serial.println("Avg now " + String(avgRightTouchVal) );
-
-    debug_p("TOUCHY ");
-    debug_p("avgRightTouchVal:");
-    debug_p(avgRightTouchVal);
-    debug_p(", longTermAvgRightTouch:");
-    debug_p(longTermAvgRightTouch);
-    debug_p(", avgRightTouchVal5:");
-    debug_p(avgRightTouchVal5);
-    debug_p(", LTpercentFive:");
-    debug_p(percentFive);
-    debug_p(" --> ");
-
-
-    if (abs(longTermAvgRightTouch-avgRightTouchVal5) > percentFive)  {
-        debug_p(">5% ");
-        isBeingTouched = true;
-        if (isBeingTouched != lastIsBeingTouched) {
-            debug_p("isBeingTouched ");
-            debug_p(char(0xE8));
-            lastIsBeingTouched = isBeingTouched;
-            trigUpdateTouchDisplay = true;
-        } else {
-            isBeingTouched = true;
-        }
-    } else {
-        debug_p("steady ");
-        if (isBeingTouched != lastIsBeingTouched) {
-            debug_p("isBeingTouched ");
-            debug_p(char(0xE8));
-            lastIsBeingTouched = isBeingTouched;
-            isBeingTouched = false;
-            trigUpdateTouchDisplay = true;
-        } else {
-            isBeingTouched = false;
-        }
-    }
-    debug_pln("");
-
-    if ((avgRightTouchVal < percentDecr) ||
-        (avgRightTouchVal > percentIncr)) {
-         lastAvgRightTouchVal = avgRightTouchVal;
-        //updateTouchDisplay();
-        trigUpdateTouchDisplay = true;
-    }
-
-    //long bigPercentIncr = (lastAvgRightTouchVal *  120)/100;  // integer math: val + 20%
-    //long bigPercentDecr = (lastAvgRightTouchVal *  80)/100;   // integer math: val - 20%
-    //
-    //if (nextActiveTouchStateCheckMillis = 0 || nextActiveTouchStateCheckMillis < millis()) {
-    //    debug_p("TOUCHY nextActiveTouchStateCheckMillis:");
-    //    debug_p(nextActiveTouchStateCheckMillis);
-    //    debug_p(", avgRightTouchVal:");
-    //    debug_p(avgRightTouchVal);
-    //    debug_p(", bigPercentDecr:");
-    //    debug_p(bigPercentDecr);
-    //    debug_p(", bigPercentIncr:");
-    //    debug_p(bigPercentIncr);
-    //    debug_p(" --> ");
-    //    if ((avgRightTouchVal < bigPercentDecr) ||
-    //        (avgRightTouchVal > bigPercentIncr)) {
-    //         isBeingTouched = true;
-    //         nextActiveTouchStateCheckMillis = millis() + 5000;
-    //         trigUpdateTouchDisplay = true;
-    //         debug_pln("TOUCHED!");
-    //    } else {
-    //         isBeingTouched = false;
-    //         nextActiveTouchStateCheckMillis = 0;
-    //         debug_pln("un TOUCHED!");
-    //    }
-    //} else {
-    //     debug_pln("skip TOUCHY");
+    //if (numLTsamples < 2) {
+    //    debug_p("Touch.. numLTsamples:");
+    //    debug_p(numLTsamples);
+    //    debug_p(", getCount():");
+    //    debug_pln(avgRightTouchLong.getCount());
     //}
+
+    if (numLTsamples > 0) {
+        avgRightTouchVal = avgRightTouch.getAvg();
+
+        int samplesToAvg = numLTsamples < 4 ? numLTsamples: 4;
+        if (longTermAvgRightTouch) {
+            longTermAvgRightTouch = avgRightTouchLong.getAvg(samplesToAvg);
+        }
+        int avgRightTouchVal5 = avgRightTouch.getAvg(5);
+        // Touch Debug/Adjust: Serial.println("TOUCH AVG: " + String(avgRightTouchVal) );
+
+        long percentIncr = (lastAvgRightTouchVal *  110)/100;  // integer math: val + 10%
+        long percentDecr = (lastAvgRightTouchVal *  90)/100;   // integer math: val - 10%
+        long percentFive = (longTermAvgRightTouch *  5)/100;   // integer math: Get 5%
+
+        int diff = abs(longTermAvgRightTouch-avgRightTouchVal5);
+        //debug_p("5% decide: LT samps:");
+        //debug_p(samplesToAvg);
+        //debug_p(", PIN:");
+        //debug_p(touchRead(BUTTON_RIGHT_TOUCH_PIN));
+        //debug_p(", longTermAvgRightTouch:");
+        //debug_p(longTermAvgRightTouch);
+        ////debug_p(", avgRightTouchVal:");
+        ////debug_p(avgRightTouchVal);
+        //debug_p(", avgRightTouchVal5:");
+        //debug_p(avgRightTouchVal5);
+        //debug_p(", diff :");
+        //debug_p(diff);
+        //debug_p(", percentFive:");
+        //debug_p(percentFive);
+
+        if (abs(longTermAvgRightTouch-avgRightTouchVal5) > percentFive)  {
+            //debug_p(" --->5% ");
+            isBeingTouched = true;
+            if (isBeingTouched != lastIsBeingTouched) {
+                //debug_p(" TOUCHED");
+                lastIsBeingTouched = isBeingTouched;
+                trigUpdateStatusLineDisplay = true;
+            } else {
+                //debug_p(" still TOUCHED");
+            }
+        } else { // UNDER 5%
+            isBeingTouched = false;
+            //debug_p(" ---steady ");
+            if (isBeingTouched != lastIsBeingTouched) {
+                //debug_p(" UNTouch CHANGE");
+                lastIsBeingTouched = isBeingTouched;
+                trigUpdateStatusLineDisplay = true;
+            } else {
+                //debug_p(" NOT Touched ");
+                isBeingTouched = false;
+            }
+        }
+        //debug_pln("");
+
+        if ((avgRightTouchVal < percentDecr) ||
+            (avgRightTouchVal > percentIncr)) {
+             lastAvgRightTouchVal = avgRightTouchVal;
+            //updateStatusLineDisplay();
+            trigUpdateStatusLineDisplay = true;
+        }
+    } else {
+        //if (!stillGatheringMsgShown) {
+        //    debug_p("Touch.. Still gathering log term average ");
+        //    debug_pln(numLTsamples);
+        //    stillGatheringMsgShown = true;
+        //}
+    }
 
     // ------------- IMU   (Accelerometer/Gyroscope)  ---------------
     if (nextMotionUnblockMillis == 1) {
         // WHAT ?? Serial.println("")
 
     } else if ( (nextMotionUnblockMillis != 0)  && (nextMotionUnblockMillis < millis())) {
-        debug_pln("ALL DONE Blocking Motion Interrupts!");
+ #if !defined(SKIP_IMU)
+       debug_pln("ALL DONE Blocking Motion Interrupts!");
         nextMotionUnblockMillis = 1;
         BMI160.setIntMotionEnabled(true);
+ #endif
     }
 
     // doing this here so we are not doing stuff during an interrupt
@@ -1182,8 +1375,8 @@ void task128ms(void)
     if ((motionDisplayNextOffMillis != 0) && motionDisplayNextOffMillis < millis()) {
         debug_pln("Turn off Temporary 'MOTION' display");
         motionDisplayNextOffMillis = 0;
-        //updateTouchDisplay();
-        trigUpdateTouchDisplay = true;
+        //updateStatusLineDisplay();
+        trigUpdateStatusLineDisplay = true;
     }
 
     // ------------- WiFi management ---------------
@@ -1191,8 +1384,8 @@ void task128ms(void)
         debug_pln("Turning OFF WiFi");
         connectionSleep();
         nextWiFiOffMS = 0;
-        //updateTouchDisplay();
-        trigUpdateTouchDisplay = true;
+        //updateStatusLineDisplay();
+        trigUpdateStatusLineDisplay = true;
     }
 }
 
@@ -1218,6 +1411,8 @@ void task50ms(void)
     //    dump_pixelAction("task50ms new pe: ", pixelAction);
     //    last_pe = pixelAction;
     //}
+
+    // can also pixel.setBrightness(50);  (before .show)
 
     if (pixelAction.nextChangeMillis > 0 && pixelAction.nextChangeMillis <= current_millis  ) {
         if (pixelAction.current_color == 0) {
@@ -1247,7 +1442,6 @@ void task50ms(void)
     if (pixelAction.flashes == 0) {
         pixelAction.nextChangeMillis = 0;
         digitalWrite(NEOPIXEL_POWER, 0);
-
     }
 }
 
@@ -1256,9 +1450,11 @@ void task50ms(void)
 void loop() {
     uint32_t sysTick = millis();
 
+#if !defined(SKIP_IMU)
     if (motionWasTriggered) {
         BMI160.setIntMotionEnabled(false);
     }
+#endif
     // ----- simpleEspConnection Handling ------
     // needed to manage the communication in the background!
     simpleEspConnection.loop();
@@ -1275,7 +1471,7 @@ void loop() {
     }
 
     avgSpeed.reading(analogRead(SPEED_CONTROL_POT_PIN));
-    avgRightTouch.reading(touchRead(BUTTON_RIGHT_TOUCH_PIN));
+    avgRightTouch.reading(touchRead(BUTTON_RIGHT_TOUCH_PIN));  // returns an INT
 
     if(sysTick - tick50 > 50){
       tick50 = sysTick;
@@ -1291,10 +1487,10 @@ void loop() {
       task10s();
     }
 
-    if(sysTick - tick30000 > 30000){
-      tick30000 = sysTick;
-      task30s();
-    }
+    //if(sysTick - tick30000 > 30000){
+    //  tick30000 = sysTick;
+    //  task30s();
+    //}
 
     // ----- Serial Commands Handling  (should go away?) ------
     //while (Serial.available()) {
