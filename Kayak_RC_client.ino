@@ -1,5 +1,5 @@
 /*
-  pre_Kayak_RC_client.ino   (WAS SimpleEspNowConnectionClient)
+  Kayak_RC_client.ino   (WAS SimpleEspNowConnectionClient)
 
   Basic EspNowConnection Client implementation
 
@@ -38,7 +38,7 @@
 #include "debug_serial_print.h"
 #include "shared_yak_messaging.h"
 
-//#define SKIP_IMU
+#define SKIP_IMU
 
 typedef struct {
     uint32_t color0;
@@ -48,7 +48,7 @@ typedef struct {
     uint8_t current_color;    // always 0 (color0) or 1 (color1)
     uint32_t nextChangeMillis;
 } PixelFlashEvent_t;
-std::forward_list<PixelFlashEvent_t> PixelFlashEvents {};
+//std::forward_list<PixelFlashEvent_t> PixelFlashEvents {};
 PixelFlashEvent_t pixelAction;
 #define PIXEL_TRIG_NOW 1
 
@@ -88,7 +88,7 @@ PixelFlashEvent_t pixelAction;
 String inputString;
 String serverAddress;
 String clientAddress;  // This is me
-    String tmpClientAddr="";
+String tmpClientAddr="";
 
 //std::vector<String> gear{ "NEUTRAL", "FORWARD", "REVERSE" };   Replaced by GEAR_t_v
 char tft_lin_buf[50];
@@ -116,6 +116,9 @@ bool lastIsBeingTouched=false;
 uint32_t nextActiveTouchStateCheckMillis=0;
 bool trigUpdateStatusLineDisplay=false;
 bool crashCheckDone=false;
+uint32_t rxTxMsgIndicate=0;  // Combination of ACTION_t | ACTION_RESULT_t
+uint32_t rxTxMsgIndicateNextOffMillis=0;
+
 
 #define DEFAULT_I2C_PORT &Wire
 
@@ -154,6 +157,7 @@ bool crashCheckDone=false;
 #define INACTIVITY_MS_BEFORE_SLEEP 1200000
 #define AFTER_MOTION_IGNORE_MS 6000
 #define MOTION_DISPLAY_MS 5000
+#define RXTX_DISPLAY_MS 5000
 #define WIFI_INACTIVITY_SLEEP 500
 #define uS_TO_S_FACTOR 1000000LL  /* Conversion factor for micro seconds to seconds */
 
@@ -403,7 +407,7 @@ void updateStatusLineDisplay(void)
         aRTV = avgRightTouchVal > 1000 ? avgRightTouchVal = avgRightTouchVal/100 : avgRightTouchVal;
         //snprintf(buf, sizeof(buf), "%3.0f", (1.0 *
         snprintf(buf, sizeof(buf), "%-3s", String(aRTV));
-        tft.setTextColor(ST77XX_MedGray);
+        tft.    setTextColor(ST77XX_MedGray);
         tft.print(buf);  tft.print("  ");
 
         if (wifiIsUp) {
@@ -413,14 +417,57 @@ void updateStatusLineDisplay(void)
         }
         tft.print("WiFi  ");
 
+#if !defined(SKIP_IMU)
         if (motionDisplayNextOffMillis != 0) {
             tft.setTextColor(ST77XX_MAGENTA);
-            tft.print("MOTION");
+            tft.print("MOTION ");
         } else {
             tft.setTextColor(ST77XX_BLACK);
+            tft.print("       ");
             //buf={0xDA,0xDA,0xDA,0xDA,0xDA,0xDA,0x0};
-            tft.print(block); // 0xDA is the CP437(false) square block
+            //tft.print(block); // 0xDA is the CP437(false) square block
         }
+#endif
+        // typedef enum { SEND_OK=0x1000, SEND_FAIL=0x2000, RESPONSE_OK=0x4000, RESPONSE_FAIL=0x8000 } ACTION_RESULT_t;
+        if (rxTxMsgIndicate & (uint32_t) SEND_OK) {
+            debug_pln("rxTxMsgIndicate SEND_OK");
+            tft.setTextColor(ST77XX_GREEN);
+        }
+        if (rxTxMsgIndicate & (uint32_t) SEND_FAIL) {
+            debug_pln("rxTxMsgIndicate SEND_FAIL");
+            tft.setTextColor(ST77XX_RED);
+        }
+        if (rxTxMsgIndicate & (uint32_t) RESPONSE_OK) {
+            debug_pln("rxTxMsgIndicate RESPONSE_OK");
+            tft.setTextColor(ST77XX_CYAN);
+        }
+        if (rxTxMsgIndicate & (uint32_t) RESPONSE_FAIL) {
+            debug_pln("rxTxMsgIndicate RESPONSE_FAIL");
+            tft.setTextColor(ST77XX_ORANGE);
+        }
+
+        switch(rxTxMsgIndicate & 0xFFFF) {  //PING, MOTOR_CONTROL, BATTERY_CHECK, BATTERY_MESSAGING, NEW_CLIENT_MAC, BLUETOOTH_PAIR }
+            //case PING:
+            //    debug_pln("rxTxMsgIndicate PN");
+            //    tft.print("PN");
+            //    break;
+
+            case MOTOR_CONTROL:
+                debug_pln("rxTxMsgIndicate MC");
+                tft.print("MC");
+                break;
+
+            case BATTERY_CHECK:
+                debug_pln("rxTxMsgIndicate BC");
+                tft.print("BC");
+                break;
+
+            default:
+                debug_p("OTHER: ");
+                debug_pln(rxTxMsgIndicate, HEX);
+                break;
+        }
+        tft.setTextColor(ST77XX_BLACK);
     } else {
         debug_pln("statusUpdateHoldoff!  Skipping display update");
     }
@@ -478,6 +525,10 @@ void onLeftPressShortRelease(void)
 
     updateGearStateDisplay();
     updateBatteryDisplay();
+
+    yakMessage.action = BATTERY_CHECK;
+    debug_pln("BATTERY_CHECK yakMessage");
+    yakMessageUpdated = true;
 
     //lineLocator(2, 13);
     //lineLocator(2, 14, 1);
@@ -672,6 +723,7 @@ void sendYakMessage()
         debug_pln("sendYakMessage: connectionWake");
         connectionWake();
     }
+    rxTxMsgIndicate = (uint32_t)  yakMessage.action;
     // resp is bool: true=OK, false=FAIL
     simpleEspConnection.sendMessage((uint8_t * ) & sendableMessage, sizeof(sendableMessage));
 }
@@ -712,11 +764,25 @@ void OnSendError(uint8_t * ad)
 {
     debug_pln("Send to " + simpleEspConnection.macToStr(ad) + " FAILED");
     flash_pixel(NeoRed, 1, 100);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=500,uint32_t color1=NeoBlack)
+    debug_p("OnSendError SEND_FAIL rxTxMsgIndicate:");
+    debug_p(rxTxMsgIndicate, HEX);
+    debug_p("  --> ");
+    rxTxMsgIndicate = (rxTxMsgIndicate & 0xFFFF) | (uint32_t) SEND_FAIL;
+    rxTxMsgIndicateNextOffMillis = millis() + RXTX_DISPLAY_MS;
+    trigUpdateStatusLineDisplay = true;
+    debug_pln(rxTxMsgIndicate, HEX);
 }
 
 void OnSendDone(uint8_t * ad)
 {
     flash_pixel(NeoMinGreen, 1, 10);  //  uint32_t color0, uint8_t flashes=1, uint32_t duration=500,uint32_t color1=NeoBlack)
+    debug_p("OnSendDone SEND_OK rxTxMsgIndicate:");
+    debug_p(rxTxMsgIndicate, HEX);
+    debug_p("  --> ");
+    rxTxMsgIndicate = (rxTxMsgIndicate & 0xFFFF) | (uint32_t) SEND_OK;
+    rxTxMsgIndicateNextOffMillis = millis() + RXTX_DISPLAY_MS;
+    trigUpdateStatusLineDisplay = true;
+    debug_pln(rxTxMsgIndicate, HEX);
 }
 
 void OnMessage(uint8_t * ad, const uint8_t * message, size_t len)
@@ -1223,6 +1289,8 @@ void task128ms(void)
         nextWiFiOffMS = millis() + WIFI_INACTIVITY_SLEEP;
         sendYakMessage();
         yakMessageUpdated = false;
+        rxTxMsgIndicateNextOffMillis = millis() + RXTX_DISPLAY_MS;
+        trigUpdateStatusLineDisplay = true;
     }
 
     // ------------- Variable Speed (potentiometer/ADC) ---------------
@@ -1378,6 +1446,14 @@ void task128ms(void)
         //updateStatusLineDisplay();
         trigUpdateStatusLineDisplay = true;
     }
+
+    if ((rxTxMsgIndicateNextOffMillis != 0) && rxTxMsgIndicateNextOffMillis < millis()) {
+        debug_pln("Turn off Temporary 'rxTxMsgIndicate' display");
+        rxTxMsgIndicateNextOffMillis = 0;
+        trigUpdateStatusLineDisplay = true;
+        rxTxMsgIndicate=0;
+    }
+
 
     // ------------- WiFi management ---------------
     if (nextWiFiOffMS > 0 && nextWiFiOffMS < millis() && wifiIsUp) {

@@ -10,7 +10,8 @@
 typedef enum gear { NEUTRAL, FORWARD, REVERSE } GEAR_t;
 
 typedef enum { YAK=0xA1, COMMS=0xB1 } MSG_t;
-typedef enum { PING, MOTOR_CONTROL, BATTERY_CHECK, BATTERY_MESSAGING, NEW_CLIENT_MAC, BLUETOOTH_PAIR } ACTION_t;
+typedef enum { PING=0, MOTOR_CONTROL=1, BATTERY_CHECK=2, BATTERY_MESSAGING=3, NEW_CLIENT_MAC=4, BLUETOOTH_PAIR=5 } ACTION_t;
+typedef enum { SEND_OK=0x10000, SEND_FAIL=0x20000, RESPONSE_OK=0x40000, RESPONSE_FAIL=0x80000 } ACTION_RESULT_t;
 
 typedef struct _yakMessage {
     MSG_t       msgType;   // uniqueify it a bit  ("YAK")
